@@ -17,6 +17,13 @@ def validate_config():
     if missing_keys:
         logger.error(f"Missing HKGOLDEN_API configuration keys: {missing_keys}")
         raise KeyError(f"Missing configuration keys: {missing_keys}")
+    
+    rate_limit_keys = ["MAX_REQUESTS", "RESET_INTERVAL"]
+    missing_rate_limit_keys = [key for key in rate_limit_keys if key not in HKGOLDEN_API["RATE_LIMIT"]]
+    if missing_rate_limit_keys:
+        logger.error(f"Missing HKGOLDEN_API['RATE_LIMIT'] keys: {missing_rate_limit_keys}")
+        raise KeyError(f"Missing RATE_LIMIT keys: {missing_rate_limit_keys}")
+    
     logger.debug(f"HKGOLDEN_API configuration: {HKGOLDEN_API}")
 
 async def fetch_page(session, url, headers, page, cat_id, sub_cat_id):
@@ -92,7 +99,7 @@ async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, req
     
     async with aiohttp.ClientSession() as session:
         for page in range(start_page, start_page + max_pages):
-            if request_counter >= HKGOLDEN_API["RATE_LIMIT"]:
+            if request_counter >= HKGOLDEN_API["RATE_LIMIT"]["MAX_REQUESTS"]:
                 rate_limit_until = current_time + HKGOLDEN_API["RATE_LIMIT_DURATION"]
                 rate_limit_info.append(f"Rate limit reached at page {page}, waiting until {datetime.fromtimestamp(rate_limit_until).strftime('%Y-%m-%d %H:%M:%S')}")
                 break
@@ -110,7 +117,7 @@ async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, req
                 replies = []
                 max_reply_pages = min(1, -(-total_replies // 25))  # 每頁最多 25 條回覆
                 for reply_page in range(1, min(max_reply_pages + 1, 2)):
-                    if request_counter >= HKGOLDEN_API["RATE_LIMIT"]:
+                    if request_counter >= HKGOLDEN_API["RATE_LIMIT"]["MAX_REQUESTS"]:
                         rate_limit_until = current_time + HKGOLDEN_API["RATE_LIMIT_DURATION"]
                         rate_limit_info.append(f"Rate limit reached at thread {thread_id}, page {reply_page}")
                         break

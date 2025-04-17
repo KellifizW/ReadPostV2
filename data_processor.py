@@ -10,8 +10,10 @@ from datetime import datetime
 from config import LIHKG_API, HKGOLDEN_API
 from grok3_client import stream_grok3_response
 import re
+from threading import Lock
 
 logger = streamlit.logger.get_logger(__name__)
+processing_lock = Lock()
 
 def clean_expired_cache(platform):
     """清理過期緩存"""
@@ -40,15 +42,17 @@ async def process_user_question(question, platform, cat_id_map, selected_cat):
     """處理用戶問題並返回相關帖子數據"""
     request_key = f"{question}:{platform}:{selected_cat}"
     current_time = time.time()
-    if ("last_request_key" in st.session_state and 
-        st.session_state["last_request_key"] == request_key and 
-        current_time - st.session_state.get("last_processed_time", 0) < 5):
-        logger.warning("Skipping duplicate process_user_question call")
-        return st.session_state.get("last_result", {
-            "response": "重複請求，請稍後重試。",
-            "rate_limit_info": [],
-            "processed_data": []
-        })
+    
+    with processing_lock:
+        if ("last_request_key" in st.session_state and 
+            st.session_state["last_request_key"] == request_key and 
+            current_time - st.session_state.get("last_processed_time", 0) < 5):
+            logger.warning("Skipping duplicate process_user_question call")
+            return st.session_state.get("last_result", {
+                "response": "重複請求，請稍後重試。",
+                "rate_limit_info": [],
+                "processed_data": []
+            })
     
     logger.info(f"Starting to process question: question={question}, platform={platform}, category={selected_cat}")
     
@@ -145,7 +149,6 @@ async def process_user_question(question, platform, cat_id_map, selected_cat):
             "processed_data": []
         }
     
-    # 恢復原始 prompt 結構，清理 HTML
     cleaned_replies = [clean_reply_text(r["msg"])[:100] + '...' if len(clean_reply_text(r["msg"])) > 100 else clean_reply_text(r["msg"]) for r in replies[:3]]
     prompt = f"""
 You are Grok, embodying the collective voice of 高登討論區. Your role is to share a post that is highly engaging, insightful, or representative of the platform's discussions. Below is a selected post from the 聊天 category, chosen for its high reply count ({selected_item["no_of_reply"]}), strong rating ({selected_item["rt"]}), and recent activity (last reply: {datetime.fromtimestamp(selected_item["lrt"]).strftime('%Y-%m-%d %H:%M:%S')}).
@@ -174,9 +177,16 @@ This 高登討論區 post is buzzing with {selected_item["no_of_reply"]} replies
     
     if "Error" in response_text:
         logger.warning(f"Falling back to local response due to Grok 3 API failure: {response_text}")
-        response = f"以下是從 {platform} 的帖子（標題：{thread_title}，ID：{thread_id}）中提取的內容：\n\n"
+        first_reply = cleaned_replies[0][:50] if cleaned_replies else "無回覆"
+        response = f"""
+Hot thread on 高登討論區 with {selected_item["no_of_reply"]} replies and a {selected_item["rt"]} rating! "{thread_title[:50]}" sparks fierce debate. First reply: "{first_reply}". Chosen for its massive engagement!
+
+Details:
+- ID: {thread_id}
+- Title: {thread_title}
+"""
         for i, data in enumerate(processed_data[:3], 1):
-            response += f"回覆 {i}：{data['content']}\n讚好：{data['like_count']}，點踩：{data['dislike_count']}\n\n"
+            response += f"\n回覆 {i}：{data['content']}\n讚好：{data['like_count']}，點踩：{data['dislike_count']}\n"
     else:
         response = response_text.strip()
     
@@ -185,9 +195,10 @@ This 高登討論區 post is buzzing with {selected_item["no_of_reply"]} replies
         "rate_limit_info": rate_limit_info,
         "processed_data": processed_data
     }
-    st.session_state["last_request_key"] = request_key
-    st.session_state["last_processed_time"] = current_time
-    st.session_state["last_result"] = result
+    with processing_lock:
+        st.session_state["last_request_key"] = request_key
+        st.session_state["last_processed_time"] = current_time
+        st.session_state["last_result"] = result
     
     logger.info(f"Processed question: question={question}, platform={platform}, response_length={len(response)}")
     

@@ -304,8 +304,10 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
                 valid_replies = []
                 for reply in replies:
                     cleaned_text = clean_reply_text(reply["msg"])
-                    if cleaned_text and any(kw in cleaned_text.lower() for kw in ["on9", "搞笑", "荒謬", "無語", "惡搞", "迷因", "傻", "荒唐"]):
-                        valid_replies.append({"content": cleaned_text})
+                    if cleaned_text:
+                        # 放寬篩選：若無「on9」關鍵字，仍保留部分回覆（最多 5 條）
+                        if len(valid_replies) < 5 or any(kw in cleaned_text.lower() for kw in ["on9", "搞笑", "荒謬", "無語", "惡搞", "迷因", "傻", "荒唐"]):
+                            valid_replies.append({"content": cleaned_text})
                 
                 thread_data = {
                     "thread_id": thread_id,
@@ -373,7 +375,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
 - 負評數：{thread['dislike_count']}
 """
         if thread["replies"]:
-            prompt += f"- 回覆（共 {len(thread['replies'])} 條，篩選後僅保留含‘on9’或搞笑相關內容）：\n"
+            prompt += f"- 回覆（共 {len(thread['replies'])} 條，篩選後保留相關內容）：\n"
             max_replies = len(thread["replies"])
             reply_count = 0
             for reply in thread["replies"]:
@@ -384,13 +386,15 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
                 prompt += reply_line
                 reply_count += 1
             if reply_count < max_replies:
-                prompt += f"  - [因長度限制，僅顯示前 {reply_count} 條回覆，篩選後總共 {max_replies} 條]\n"
+                prompt += f"  - [因長度限制，僅顯示前 {reply_count} 條回覆，總共 {max_replies} 條]\n"
+        else:
+            prompt += "- 回覆：無（未找到符合‘on9’或搞笑相關內容的回覆）\n"
     
     prompt_length = len(prompt)
     
     prompt += f"""
 請完成以下任務：
-1. 生成一段簡潔的分享或排列文字，嚴格限制在 {share_text_limit} 字以內，列出 {analysis['num_threads']} 個帖子，按回覆數量降序排列，包含每個帖子的標題、回覆數量、最後回覆時間、點讚數和負評數。針對「on9」問題，總結每個帖子的「on9」特質（例如搞笑、荒謬、爭議性內容），基於回覆內容分析主要觀點、情緒或熱門話題。
+1. 生成一段簡潔的分享或排列文字，嚴格限制在 {share_text_limit} 字以內，列出 {analysis['num_threads']} 個帖子，按回覆數量降序排列，包含每個帖子的標題、回覆數量、最後回覆時間、點讚數和負評數。針對「on9」問題，總結每個帖子的「on9」特質（例如搞笑、荒謬、爭議性內容），若無回覆數據，則基於標題推測其搞笑或荒謬特質。
 2. 提供一段簡短的選擇理由（{reason_limit} 字以內），解釋為何選擇這些帖子（例如話題性、符合「on9」特質、近期熱度等）。
 3. 若回覆數量過多，根據回覆策略（{analysis['reply_strategy']}）優先總結最新或最相關的回覆內容。
 

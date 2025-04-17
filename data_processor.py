@@ -20,7 +20,7 @@ def clean_expired_cache(platform):
 
 async def process_user_question(question, platform, cat_id_map, selected_cat):
     """處理用戶問題並返回相關帖子數據"""
-    logger.info(f"Processing question: question={question}, platform={platform}, category={selected_cat}")
+    logger.info(f"Starting to process question: question={question}, platform={platform}, category={selected_cat}")
     
     clean_expired_cache(platform)
     
@@ -65,9 +65,18 @@ async def process_user_question(question, platform, cat_id_map, selected_cat):
         }
     
     selected_item = random.choice(filtered_items)
-    thread_id = selected_item["id"] if platform == "HKGOLDEN" else selected_item["thread_id"]
+    try:
+        thread_id = selected_item["id"] if platform in ["HKGOLDEN", "高登討論區"] else selected_item["thread_id"]
+    except KeyError as e:
+        logger.error(f"Missing thread_id or id in selected_item: {selected_item}, error={str(e)}")
+        return {
+            "response": "無法提取帖子 ID，請稍後重試。",
+            "rate_limit_info": rate_limit_info,
+            "processed_data": []
+        }
+    
     thread_title = selected_item["title"]
-    replies = selected_item.get("replies", [])
+    replies = selected_item.get("replies", []) or []
     
     logger.info(f"Selected thread: thread_id={thread_id}, title={thread_title}, replies={len(replies)}")
     
@@ -76,8 +85,8 @@ async def process_user_question(question, platform, cat_id_map, selected_cat):
             "thread_id": thread_id,
             "title": thread_title,
             "content": clean_html(reply["msg"]),
-            "like_count": reply.get("like_count", 0),  # 高登無此字段，設為 0
-            "dislike_count": reply.get("dislike_count", 0)  # 高登無此字段，設為 0
+            "like_count": reply.get("like_count", 0),
+            "dislike_count": reply.get("dislike_count", 0)
         }
         for reply in replies
     ]

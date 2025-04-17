@@ -7,10 +7,10 @@ import streamlit.logger
 import time
 import random
 from datetime import datetime
-from config import LIHKG_API, HKGOLDEN_API, GROK3_API
-import aiohttp
-import json
+from config import LIHKG_API, HKGOLDEN_API
+import re
 from threading import Lock
+from grok3_client import call_grok3_api
 
 logger = streamlit.logger.get_logger(__name__)
 processing_lock = Lock()
@@ -32,56 +32,12 @@ def score_item(item, current_time):
     return score
 
 def clean_reply_text(text):
-    """清理回覆中的 HTML 標籤，保留純文字"""
-    import re
-    text = re.sub(r'<img[^>]+alt="\[([^\]]+)\]"[^>]*>', r'[\1]', text)
+    """清理回覆中的 HTML 標籤和表情符號，保留純文字"""
+    text = re.sub(r'\[sosad\]', '(sad)', text)  # 替換 [sosad] 表情符號
+    text = re.sub(r'<img[^>]+alt="\[([^\]]+)\]"[^>]*>', r'(\1)', text)
     text = clean_html(text)
     text = ' '.join(text.split())
     return text
-
-async def call_grok3_api(prompt):
-    """非流式調用 Grok 3 API"""
-    try:
-        api_key = st.secrets["grok3key"]
-    except KeyError:
-        logger.error("Grok 3 API key is missing in Streamlit secrets (grok3key).")
-        return {"error": "Grok 3 API key is missing."}
-    
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-    }
-    
-    payload = {
-        "model": GROK3_API["MODEL"],
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": GROK3_API["MAX_TOKENS"],
-        "stream": False
-    }
-    
-    async with aiohttp.ClientSession() as session:
-        try:
-            start_time = time.time()
-            logger.info(f"Sending Grok 3 API request: prompt_length={len(prompt)}")
-            async with session.post(
-                f"{GROK3_API['BASE_URL']}/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=300  # 增加超時到 300 秒
-            ) as response:
-                elapsed_time = time.time() - start_time
-                response_text = await response.text()
-                logger.info(f"Grok 3 API response: status={response.status}, elapsed={elapsed_time:.2f}s")
-                if response.status != 200:
-                    logger.error(f"Grok 3 API failed: status={response.status}, reason={response_text}")
-                    return {"error": f"API request failed with status {response.status}: {response_text}"}
-                data = json.loads(response_text)
-                content = data.get("choices", [{}])[0].get("message", {}).get("content", "No content")
-                return {"content": content}
-        except Exception as e:
-            logger.error(f"Grok 3 API error: type={type(e).__name__}, message={str(e)}")
-            return {"error": str(e)}
 
 async def process_user_question(question, platform, cat_id_map, selected_cat):
     """處理用戶問題並返回相關帖子數據"""
@@ -197,7 +153,6 @@ async def process_user_question(question, platform, cat_id_map, selected_cat):
             "processed_data": []
         }
     
-    # 限制回覆數量和長度以簡化提示
     cleaned_replies = [clean_reply_text(r["msg"])[:50] + '...' if len(clean_reply_text(r["msg"])) > 50 else clean_reply_text(r["msg"]) for r in replies[:2]]
     prompt = f"""
 You are Grok, sharing a notable post from 高登討論區. Below is a selected post from the {selected_cat} category, chosen for high engagement ({selected_item["no_of_reply"]} replies, rating {selected_item["rt"]}) and recent activity (last reply: {datetime.fromtimestamp(selected_item["lrt"]).strftime('%Y-%m-%d %H:%M:%S')}).
@@ -222,8 +177,8 @@ Hot 高登 post with {selected_item["no_of_reply"]} replies! "{thread_title[:50]
     api_elapsed = time.time() - start_api_time
     logger.info(f"Grok 3 API call completed: elapsed={api_elapsed:.2f}s")
     
-    if "error" in api_result:
-        logger.warning(f"Falling back to local response due to Grok 3 API failure: {api_result['error']}")
+    if api_result.get("status") == "error":
+        logger.warning(f"Falling back to local response due to Grok 3 API failure: {api_result['content']}")
         first_reply = cleaned_replies[0][:50] if cleaned_replies else "無回覆"
         response = f"""
 Hot thread on 高登討論區 with {selected_item["no_of_reply"]} replies! "{thread_title[:50]}" sparks debate. First reply: "{first_reply}". Chosen for high engagement!

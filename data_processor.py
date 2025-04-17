@@ -41,7 +41,7 @@ async def analyze_user_question(question, platform):
 1. 問題的主要意圖是什麼？（例如：尋找特定話題、分析熱門帖子、查詢回覆數量等）
 2. 需要抓取哪些類型的數據？（例如：帖子標題、回覆內容、點讚數）
 3. 建議抓取的帖子數量（1-5個）？
-4. 每個帖子的回覆數量（1-50條）？
+4. 每個帖子的回覆數量（1-100條）？
 5. 有無關鍵字或條件用於篩選帖子？（例如：包含特定詞語、按點讚數排序）
 
 回應格式：
@@ -60,7 +60,7 @@ async def analyze_user_question(question, platform):
             "intent": "unknown",
             "data_types": ["title", "replies"],
             "num_threads": 1,
-            "num_replies": 3,
+            "num_replies": 10,  # 預設值改為 10
             "filter_condition": "none"
         }
     
@@ -71,7 +71,7 @@ async def analyze_user_question(question, platform):
     intent = "unknown"
     data_types = ["title", "replies"]
     num_threads = 1
-    num_replies = 3
+    num_replies = 10  # 預設值改為 10
     filter_condition = "none"
     
     for line in content.split("\n"):
@@ -87,7 +87,7 @@ async def analyze_user_question(question, platform):
                 pass
         elif line.startswith("回覆數量:"):
             try:
-                num_replies = min(max(int(line.replace("回覆數量:", "").strip()), 1), 50)
+                num_replies = min(max(int(line.replace("回覆數量:", "").strip()), 1), 100)  # 放寬上限到 100
             except ValueError:
                 pass
         elif line.startswith("篩選條件:"):
@@ -123,7 +123,8 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
     
     cat_id = cat_id_map[selected_cat]
     max_pages = max(1, analysis["num_threads"])
-    max_replies = analysis["num_replies"]
+    max_replies = min(analysis["num_replies"], 100)  # 確保不超過 100
+    logger.info(f"Fetching thread with max_replies={max_replies}")
     
     # 抓取帖子列表
     start_fetch_time = time.time()
@@ -178,9 +179,11 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
             if any(keyword.lower() in item["title"].lower() for keyword in keywords) and item.get("no_of_reply", 0) > 0
         ]
     if not selected_items:
-        selected_items = [item for item in items if item.get("no_of_reply", 0) > 0]
-    if not selected_items:
-        selected_items = items
+        selected_items = [item for item in items if item.get("no_of_reply", 0) >= 50]  # 優先選擇回覆數量 >= 50
+        if not selected_items:
+            selected_items = [item for item in items if item.get("no_of_reply", 0) > 0]
+        if not selected_items:
+            selected_items = items
     
     # 隨機選擇指定數量的帖子
     num_threads = min(analysis["num_threads"], len(selected_items))
@@ -278,11 +281,14 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
             prompt += f"  - {content}（正評：{reply['like_count']}，負評：{reply['dislike_count']}）\n"
     
     prompt += f"""
-根據用戶問題和帖子數據，生成一段簡潔的分享文字，必須嚴格限制在280字以內，且僅返回 {{ output }} 部分的內容，突出帖子的吸引之處，包含標題和首條回覆的片段（若有）。
+請完成以下任務：
+1. 生成一段簡潔的分享文字，嚴格限制在 500 字以內，突出帖子的吸引之處，包含標題和首條回覆的片段（若有）。
+2. 提供一段簡短的選擇理由（150 字以內），解釋為何選擇此帖子（例如話題性、幽默性、爭議性等）。
 
-範例：
+回應格式：
 {{ output }}
-熱門 {platform} 帖子！"{threads_data[0]['title'][:50] if threads_data else '無標題'}" 引發熱議。首條回覆："{threads_data[0]['replies'][0]['content'][:50] if threads_data and threads_data[0]['replies'] else '無回覆'}"。快來看看！
+分享文字：{分享文字}
+選擇理由：{選擇理由}
 {{ output }}
 """
     
@@ -315,12 +321,21 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
             response += f"""
 - "{thread['title'][:50]}" 引發討論。首條回覆："{first_reply}"。
 """
-        response = response[:280]
+        response = response[:500]
     else:
         # 提取 {{ output }} 部分並截斷
         content = api_result["content"].strip()
         match = re.search(r'\{\{ output \}\}(.*?)\{\{ output \}\}', content, re.DOTALL)
-        response = match.group(1).strip()[:280] if match else content[:280]
+        if match:
+            response = match.group(1).strip()
+            # 分離分享文字和選擇理由，並分別截斷
+            response_lines = response.split('\n')
+            share_text = response_lines[0].replace('分享文字：', '').strip()[:500] if response_lines else response[:500]
+            reason = response_lines[1].replace('選擇理由：', '').strip()[:150] if len(response_lines) > 1 else ''
+            response = f"分享文字：{share_text}\n選擇理由：{reason}"
+        else:
+            response = re.sub(r'\{\{ output \}\}', '', content).strip()[:650]
+            logger.warning(f"Failed to extract {{ output }} block, using cleaned content: {response[:100]}...")
     
     result = {
         "response": response,
@@ -335,5 +350,6 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
             del active_requests[request_key]
     
     logger.info(f"Processed question: question={question}, platform={platform}, response_length={len(response)}")
+    logger.info(f"Selected {len(selected_items)} threads, total replies fetched: {sum(len(thread['replies']) for thread in threads_data)}")
     
     return result

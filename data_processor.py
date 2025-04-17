@@ -245,4 +245,20 @@ Details:
 - Title: {thread_title}
 """
         for i, data in enumerate(processed_data[:2], 1):
-            response += f"\n回覆 {i}：{data['content'][:50]}...\n讚好：{data['like_count']}，
+            response += f"\n回覆 {i}：{data['content'][:50]}...\n讚好：{data['like_count']}，點踩：{data['dislike_count']}\n"
+    else:
+        response = api_result["content"].strip()
+    
+    result = {
+        "response": response,
+        "rate_limit_info": rate_limit_info,
+        "processed_data": processed_data
+    }
+    with processing_lock:
+        st.session_state["last_request_key"] = request_key
+        st.session_state["last_processed_time"] = current_time
+        st.session_state["last_result"] = result
+    
+    logger.info(f"Processed question: question={question}, platform={platform}, response_length={len(response)}")
+    
+    return result

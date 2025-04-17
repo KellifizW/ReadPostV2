@@ -1,4 +1,3 @@
-```python
 import streamlit as st
 from chat_page import chat_page
 from test_page import test_page
@@ -23,4 +22,3 @@ async def main():
 if __name__ == "__main__":
     # 在 Streamlit 中運行異步主函數
     asyncio.run(main())
-```

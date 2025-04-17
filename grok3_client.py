@@ -53,6 +53,7 @@ async def call_grok3_api(prompt: str) -> dict:
     
     async with aiohttp.ClientSession() as session:
         try:
+            start_time = time.time()
             logger.info(f"Sending Grok 3 API request: url={GROK3_API['BASE_URL']}/chat/completions")
             async with session.post(
                 f"{GROK3_API['BASE_URL']}/chat/completions",
@@ -60,14 +61,18 @@ async def call_grok3_api(prompt: str) -> dict:
                 json=payload,
                 timeout=300  # 增加超時到 300 秒
             ) as response:
+                elapsed_time = time.time() - start_time
                 response_text = await response.text()
-                logger.info(f"Grok 3 API response: status={response.status}, body={response_text[:100]}...")
+                logger.info(f"Grok 3 API response: status={response.status}, elapsed={elapsed_time:.2f}s, body={response_text[:100]}...")
                 if response.status != 200:
                     logger.error(f"Grok 3 API request failed: status={response.status}, reason={response_text}")
                     return {"content": f"Error: API request failed with status {response.status}: {response_text}", "status": "error"}
                 data = json.loads(response_text)
                 content = data.get("choices", [{}])[0].get("message", {}).get("content", "No content")
                 return {"content": content, "status": "success"}
+        except aiohttp.ClientPayloadError as e:
+            logger.error(f"Grok 3 API payload error: type={type(e).__name__}, message={str(e)}")
+            return {"content": f"Error: API payload error - {str(e)}", "status": "error"}
         except aiohttp.ClientError as e:
             logger.error(f"Grok 3 API connection error: type={type(e).__name__}, message={str(e)}")
             return {"content": f"Error: API connection failed - {str(e)}", "status": "error"}

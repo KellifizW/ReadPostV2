@@ -197,11 +197,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
     selected_items = []
     filter_condition = analysis["filter_condition"].lower()
     today = datetime.now(HONG_KONG_TZ).date()
-    try:
-        three_days_ago = today - timedelta(days=3)
-    except Exception as e:
-        logger.error(f"Failed to calculate date range: error={str(e)}")
-        three_days_ago = today  # 回退至僅今日
+    three_days_ago = today - timedelta(days=3)
     
     filtered_items = []
     for item in items:
@@ -427,6 +423,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
         if api_result.get("status") == "error":
             logger.warning(f"Stream failed: request_key={request_key}, error={api_result['content']}")
             for attempt in range(2):
+                logger.info(f"Retrying sync API call: attempt={attempt+1}, request_key={request_key}")
                 api_result_sync = await call_grok3_api(prompt, stream=False)
                 api_elapsed = time.time() - start_api_time
                 logger.info(f"Grok 3 API retry completed: elapsed={api_elapsed:.2f}s")
@@ -437,7 +434,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
             
             if api_result_sync.get("status") == "error":
                 logger.error(f"Retry failed: request_key={request_key}, error={api_result_sync['content']}")
-                yield f"無法生成回應，API 連接失敗：{api_result_sync['content']}"
+                yield f"無法生成回應，API 連接失敗：{api_result_sync['content']}\n"
                 return
             
             content = api_result_sync["content"]
@@ -461,35 +458,40 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
             return
         
         buffer = ""
-        async for chunk in api_result["content"]:
-            if chunk:
-                logger.debug(f"Received chunk: {chunk[:50]}...")
-                try:
-                    if chunk.strip() == "data: [DONE]":
-                        break
-                    if chunk.strip().startswith("data:"):
-                        json_data = json.loads(chunk.strip().replace("data: ", ""))
-                        if "choices" in json_data and json_data["choices"]:
-                            content = json_data["choices"][0].get("delta", {}).get("content", "")
-                            if content:
-                                buffer += content
-                except json.JSONDecodeError as e:
-                    logger.warning(f"Failed to parse JSON chunk: {chunk}, error={str(e)}")
-                    continue
-                
-                while "\n" in buffer or len(buffer) >= 50:
-                    if "\n" in buffer:
-                        line, buffer = buffer.split("\n", 1)
-                        yield line + "\n"
+        try:
+            async for chunk in api_result["content"]:
+                if chunk:
+                    logger.debug(f"Received chunk: {chunk[:50]}...")
+                    try:
+                        if chunk.strip() == "data: [DONE]":
+                            break
+                        if chunk.strip().startswith("data:"):
+                            json_data = json.loads(chunk.strip().replace("data: ", ""))
+                            if "choices" in json_data and json_data["choices"]:
+                                content = json_data["choices"][0].get("delta", {}).get("content", "")
+                                if content:
+                                    buffer += content
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"Failed to parse JSON chunk: {chunk}, error={str(e)}")
+                        continue
+                    
+                    while "\n" in buffer or len(buffer) >= 50:
+                        if "\n" in buffer:
+                            line, buffer = buffer.split("\n", 1)
+                            yield line + "\n"
+                            await asyncio.sleep(0.05)
+                        else:
+                            yield buffer[:50] + "\n"
+                            buffer = buffer[50:]
+                            await asyncio.sleep(0.05)
+                    if buffer:
+                        yield buffer + "\n"
+                        buffer = ""
                         await asyncio.sleep(0.05)
-                    else:
-                        yield buffer[:50] + "\n"
-                        buffer = buffer[50:]
-                        await asyncio.sleep(0.05)
-                if buffer:
-                    yield buffer + "\n"
-                    buffer = ""
-                    await asyncio.sleep(0.05)
+        except (aiohttp.ClientConnectionError, aiohttp.ClientResponseError, aiohttp.ClientConnectorError, asyncio.TimeoutError) as e:
+            logger.error(f"Stream error in stream_response: request_key={request_key}, error={str(e)}")
+            yield f"無法生成回應，API 連接失敗：{str(e)}\n"
+            return
         
         if buffer:
             yield buffer + "\n"

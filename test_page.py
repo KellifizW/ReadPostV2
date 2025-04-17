@@ -66,7 +66,7 @@ async def test_page():
     
     # 檢查是否處於速率限制中
     if time.time() < st.session_state.rate_limit_until:
-        st.error(f"API 速率限制中，請在 {datetime.fromtimestamp(st.session_state.rate_limit_until)} 後重試。")
+        st.error(f"API 速率限制中，請在 {datetime.fromtimestamp(st.session_state.rate_limit_until, tz=HONG_KONG_TZ).strftime('%Y-%m-%d %H:%M:%S')} 後重試。")
         return
     
     platform = st.selectbox("選擇討論區平台", ["LIHKG", "高登討論區"], index=0)
@@ -90,10 +90,10 @@ async def test_page():
     with col1:
         st.markdown("#### 速率限制狀態")
         st.markdown(f"- 當前請求計數: {st.session_state.request_counter}")
-        st.markdown(f"- 最後重置時間: {datetime.fromtimestamp(st.session_state.last_reset)}")
+        st.markdown(f"- 最後重置時間: {datetime.fromtimestamp(st.session_state.last_reset, tz=HONG_KONG_TZ).strftime('%Y-%m-%d %H:%M:%S')}")
         st.markdown(
             f"- 速率限制解除時間: "
-            f"{datetime.fromtimestamp(st.session_state.rate_limit_until) if st.session_state.rate_limit_until > time.time() else '無限制'}"
+            f"{datetime.fromtimestamp(st.session_state.rate_limit_until, tz=HONG_KONG_TZ).strftime('%Y-%m-%d %H:%M:%S') if st.session_state.rate_limit_until > time.time() else '無限制'}"
         )
         
         if st.button("抓取數據"):
@@ -201,4 +201,7 @@ async def test_page():
                             st.markdown(f"- 最後回覆時間: {last_reply_time}")
                         else:
                             st.markdown(f"未找到帖子 ID {thread_id} 的信息。")
-                            logger.warning(f"查詢失敗
+                            logger.warning(f"查詢失敗: thread_id={thread_id}")
+                except ValueError:
+                    st.error("請輸入有效的帖子 ID（數字）。")
+                    logger.error(f"無效的帖子 ID: {thread_id_input}")

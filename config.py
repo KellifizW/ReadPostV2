@@ -1,4 +1,5 @@
-# config.py
+import streamlit as st
+
 GENERAL = {
     "TIMEZONE": "Asia/Hong_Kong"
 }
@@ -41,7 +42,7 @@ HKGOLDEN_API = {
 
 GROK3_API = {
     "BASE_URL": "https://api.x.ai/v1",
-    "API_KEY": "YOUR_GROK3_API_KEY",  # 替換為真實的 xAI Grok 3 API 密鑰
+    "API_KEY": st.secrets.get("grok3key", ""),  # 從 Streamlit secrets 載入
     "MODEL": "grok-3",
     "MAX_TOKENS": 4096,
     "RATE_LIMIT": {

@@ -56,6 +56,8 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, mi
             })
     
     logger.info(f"Processing question: question={question}, platform={platform}, category={selected_cat}, min_replies={min_replies}")
+    logger.debug(f"LIHKG_API configuration: {LIHKG_API}")
+    logger.debug(f"HKGOLDEN_API configuration: {HKGOLDEN_API}")
     
     clean_expired_cache(platform)
     
@@ -66,9 +68,6 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, mi
     rate_limit_info = []
     
     try:
-        # 記錄 API 配置
-        logger.debug(f"Platform={platform}, API config: {HKGOLDEN_API if platform == '高登討論區' else LIHKG_API}")
-        
         # 多頁抓取並合併
         for page in range(1, HKGOLDEN_API["MAX_PAGES"] + 1):
             logger.info(f"Fetching cat_id={cat_id}, page={page}")

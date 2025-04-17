@@ -14,6 +14,7 @@ from threading import Lock
 
 logger = streamlit.logger.get_logger(__name__)
 processing_lock = Lock()
+active_requests = {}
 
 def clean_expired_cache(platform):
     """清理過期緩存"""
@@ -66,7 +67,7 @@ async def analyze_user_question(question, platform):
     content = api_result["content"].strip()
     logger.info(f"Analysis result: {content[:200]}...")
     
-    # 簡單解析回應（假設Grok 3遵循格式）
+    # 解析回應
     intent = "unknown"
     data_types = ["title", "replies"]
     num_threads = 1
@@ -80,9 +81,15 @@ async def analyze_user_question(question, platform):
         elif line.startswith("數據類型:"):
             data_types = [t.strip() for t in line.replace("數據類型:", "").strip().split(",")]
         elif line.startswith("帖子數量:"):
-            num_threads = min(max(int(line.replace("帖子數量:", "").strip()), 1), 5)
+            try:
+                num_threads = min(max(int(line.replace("帖子數量:", "").strip()), 1), 5)
+            except ValueError:
+                pass
         elif line.startswith("回覆數量:"):
-            num_replies = min(max(int(line.replace("回覆數量:", "").strip()), 1), 50)
+            try:
+                num_replies = min(max(int(line.replace("回覆數量:", "").strip()), 1), 50)
+            except ValueError:
+                pass
         elif line.startswith("篩選條件:"):
             filter_condition = line.replace("篩選條件:", "").strip()
     
@@ -96,22 +103,17 @@ async def analyze_user_question(question, platform):
 
 async def process_user_question(question, platform, cat_id_map, selected_cat, return_prompt=False):
     """處理用戶問題並返回相關帖子數據或原始 prompt"""
-    request_key = f"{question}:{platform}:{selected_cat}"
+    request_key = f"{question}:{platform}:{selected_cat}:{'preview' if return_prompt else 'normal'}"
     current_time = time.time()
     
     with processing_lock:
-        if ("last_request_key" in st.session_state and 
-            st.session_state["last_request_key"] == request_key and 
-            current_time - st.session_state.get("last_processed_time", 0) < 5):
-            logger.warning("Skipping duplicate process_user_question call")
-            return st.session_state.get("last_result", {
-                "response": "重複請求，請稍後再試。",
-                "rate_limit_info": [],
-                "processed_data": [],
-                "analysis": None
-            })
+        if request_key in active_requests and current_time - active_requests[request_key]["timestamp"] < 30:
+            logger.warning(f"Skipping duplicate request: request_key={request_key}")
+            return active_requests[request_key]["result"]
+        
+        active_requests[request_key] = {"timestamp": current_time, "result": None}
     
-    logger.info(f"Starting to process question: question={question}, platform={platform}, category={selected_cat}")
+    logger.info(f"Starting to process question: request_key={request_key}")
     
     clean_expired_cache(platform)
     
@@ -120,7 +122,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
     logger.info(f"Question analysis: intent={analysis['intent']}, num_threads={analysis['num_threads']}, num_replies={analysis['num_replies']}")
     
     cat_id = cat_id_map[selected_cat]
-    max_pages = max(1, analysis["num_threads"])  # 確保至少抓取1頁
+    max_pages = max(1, analysis["num_threads"])
     max_replies = analysis["num_replies"]
     
     # 抓取帖子列表
@@ -156,12 +158,14 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
     
     if not items:
         logger.error("No items fetched from API")
-        return {
+        result = {
             "response": f"無法抓取帖子，API 返回空數據。請檢查分類（{selected_cat}）或稍後重試。",
             "rate_limit_info": rate_limit_info,
             "processed_data": [],
             "analysis": analysis
         }
+        active_requests[request_key]["result"] = result
+        return result
     
     # 根據篩選條件選擇帖子
     selected_items = []
@@ -259,73 +263,3 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
 - 意圖：{analysis['intent']}
 - 數據類型：{', '.join(analysis['data_types'])}
 - 篩選條件：{analysis['filter_condition']}
-
-帖子數據：
-"""
-    for thread in threads_data:
-        prompt += f"""
-- 帖子 ID：{thread['thread_id']}
-- 標題：{thread['title']}
-- 回覆（前 {len(thread['replies'])} 條）：
-"""
-        for reply in thread["replies"]:
-            content = reply["content"][:100] + '...' if len(reply["content"]) > 100 else reply["content"]
-            prompt += f"  - {content}（正評：{reply['like_count']}，負評：{reply['dislike_count']}）\n"
-    
-    prompt += """
-根據用戶問題和帖子數據，生成一段簡潔的分享文字（最多280字），突出帖子的吸引之處，並包含標題和首條回覆的片段（若有）。
-
-範例：
-熱門 {platform} 帖子！"{threads_data[0]['title'][:50]}" 引發熱議。首條回覆："{threads_data[0]['replies'][0]['content'][:50] if threads_data and threads_data[0]['replies'] else '無回覆'}"。快來看看！
-
-{{ output }}
-"""
-    
-    logger.info(f"Generated prompt (length={len(prompt)} chars)")
-    
-    if return_prompt:
-        return {
-            "response": prompt,
-            "rate_limit_info": rate_limit_info,
-            "processed_data": processed_data,
-            "analysis": analysis
-        }
-    
-    # 調用Grok 3生成回應
-    start_api_time = time.time()
-    api_result = await call_grok3_api(prompt)
-    api_elapsed = time.time() - start_api_time
-    logger.info(f"Grok 3 API call completed: elapsed={api_elapsed:.2f}s")
-    
-    if api_result.get("status") == "error":
-        logger.warning(f"Falling back to local response due to Grok 3 API failure: {api_result['content']}")
-        response = f"""
-熱門帖子來自 {platform}！問題意圖：{analysis['intent']}。
-"""
-        for thread in threads_data[:1]:
-            first_reply = thread["replies"][0]["content"][:50] if thread["replies"] else "無回覆"
-            response += f"""
-- "{thread['title'][:50]}" 引發討論。首條回覆："{first_reply}"。
-詳細：
-- ID：{thread['thread_id']}
-- 標題：{thread['title']}
-"""
-            for i, reply in enumerate(thread["replies"][:3], 1):
-                response += f"\n回覆 {i}：{reply['content'][:50]}...\n正評：{reply['like_count']}，負評：{reply['dislike_count']}\n"
-    else:
-        response = api_result["content"].strip()
-    
-    result = {
-        "response": response,
-        "rate_limit_info": rate_limit_info,
-        "processed_data": processed_data,
-        "analysis": analysis
-    }
-    with processing_lock:
-        st.session_state["last_request_key"] = request_key
-        st.session_state["last_processed_time"] = current_time
-        st.session_state["last_result"] = result
-    
-    logger.info(f"Processed question: question={question}, platform={platform}, response_length={len(response)}")
-    
-    return result

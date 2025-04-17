@@ -13,8 +13,8 @@ logger = streamlit.logger.get_logger(__name__)
 
 # 隨機化的 User-Agent 列表
 USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0",
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Mobile/15E148 Safari/604.1"
 ]
@@ -143,7 +143,7 @@ async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, req
                             break
                         
                         data = await response.json()
-                        if not data.get("success", True):
+                        if not data.get("result", True):
                             error_message = data.get("error_message", "Unknown error")
                             rate_limit_info.append(
                                 f"{current_time} - API returned failure: cat_id={cat_id}, page={page}, error={error_message}"
@@ -162,10 +162,10 @@ async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, req
                             {
                                 "thread_id": item["id"],
                                 "title": item.get("title", "Unknown title"),
-                                "no_of_reply": item.get("replies", 0),
-                                "last_reply_time": item.get("last_reply_time", 0),
-                                "like_count": item.get("like_count", 0),
-                                "dislike_count": item.get("dislike_count", 0)
+                                "no_of_reply": item.get("totalReplies", 0),
+                                "last_reply_time": item.get("lastReplyDate", 0) / 1000,
+                                "like_count": item.get("marksGood", 0),
+                                "dislike_count": item.get("marksBad", 0)
                             }
                             for item in new_items
                         ]
@@ -214,7 +214,8 @@ async def get_hkgolden_thread_content(thread_id, cat_id=None, request_counter=0,
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "zh-HK,zh-Hant;q=0.9,en;q=0.8",
         "Connection": "keep-alive",
-        "Referer": f"{HKGOLDEN_API['BASE_URL']}/topic/{thread_id}",
+        "Referer": f"{HKGOLDEN_API['BASE_URL']}/view/{thread_id}",
+        "hkgauth": "null"
     }
     
     replies = []
@@ -252,14 +253,12 @@ async def get_hkgolden_thread_content(thread_id, cat_id=None, request_counter=0,
                 "s": api_key,
                 "message": str(thread_id),
                 "page": str(page),
-                "count": "100",
                 "user_id": "0",
-                "block": "Y",
-                "sensormode": "N",
-                "filterMode": "N",
+                "sensormode": "Y",
+                "hideblock": "N",
                 "returntype": "json"
             }
-            url = f"{HKGOLDEN_API['BASE_URL']}/v1/topic/{thread_id}/messages"
+            url = f"{HKGOLDEN_API['BASE_URL']}/v1/view/{thread_id}/{page}"
             
             fetch_conditions = {
                 "thread_id": thread_id,
@@ -307,7 +306,7 @@ async def get_hkgolden_thread_content(thread_id, cat_id=None, request_counter=0,
                             break
                         
                         data = await response.json()
-                        if not data.get("success", True):
+                        if not data.get("result", True):
                             error_message = data.get("error_message", "Unknown error")
                             rate_limit_info.append(
                                 f"{current_time} - API returned failure: thread_id={thread_id}, page={page}, error={error_message}"
@@ -318,19 +317,20 @@ async def get_hkgolden_thread_content(thread_id, cat_id=None, request_counter=0,
                             await asyncio.sleep(1)
                             break
                         
+                        thread_data = data.get("data", {})
                         if page == 1:
-                            thread_title = data.get("title", "Unknown title")
-                            total_replies = data.get("total_replies", 0)
+                            thread_title = thread_data.get("title", "Unknown title")
+                            total_replies = thread_data.get("totalReplies", 0)
                         
-                        new_replies = data.get("messages", [])
+                        new_replies = thread_data.get("replies", [])
                         if not new_replies:
                             break
                         
                         standardized_replies = [
                             {
                                 "msg": reply.get("content", ""),
-                                "like_count": reply.get("like_count", 0),
-                                "dislike_count": reply.get("dislike_count", 0)
+                                "like_count": reply.get("marksGood", 0),
+                                "dislike_count": reply.get("marksBad", 0)
                             }
                             for reply in new_replies
                         ]

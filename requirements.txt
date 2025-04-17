@@ -1,4 +1,5 @@
 requests
 aiohttp
+aiohttp-retry
 nest_asyncio
 pytz

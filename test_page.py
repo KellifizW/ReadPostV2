@@ -5,6 +5,7 @@ from datetime import datetime
 import random
 import pytz
 import aiohttp
+import hashlib
 from lihkg_api import get_lihkg_topic_list
 from hkgolden_api import get_hkgolden_topic_list
 import streamlit.logger
@@ -12,6 +13,12 @@ from config import LIHKG_API, HKGOLDEN_API, GENERAL
 
 logger = st.logger.get_logger(__name__)
 HONG_KONG_TZ = pytz.timezone(GENERAL["TIMEZONE"])
+
+def get_api_search_key(query: str, page: int, user_id: str = "%GUEST%") -> str:
+    """生成搜索API密鑰"""
+    date_string = datetime.now().strftime("%Y%m%d")
+    filter_mode = "N"
+    return hashlib.md5(f"{date_string}_HKGOLDEN_{user_id}_$API#Android_1_2^{query}_{page}_{filter_mode}_N".encode()).hexdigest()
 
 async def search_thread_by_id(thread_id, platform):
     """使用搜尋 API 查詢帖子詳細信息"""
@@ -27,14 +34,27 @@ async def search_thread_by_id(thread_id, platform):
         "Referer": f"{LIHKG_API['BASE_URL'] if platform == 'LIHKG' else HKGOLDEN_API['BASE_URL']}/",
     }
     
-    url = (
-        f"{LIHKG_API['BASE_URL']}/api_v2/thread/search?q={thread_id}&page=1&count=30&sort=score&type=thread"
-        if platform == "LIHKG"
-        else f"{HKGOLDEN_API['BASE_URL']}/v1/topics/search?q={thread_id}&page=1&count=30"
-    )
+    if platform == "LIHKG":
+        url = f"{LIHKG_API['BASE_URL']}/api_v2/thread/search?q={thread_id}&page=1&count=30&sort=score&type=thread"
+        params = {}
+    else:
+        api_key = get_api_search_key(str(thread_id), 1)
+        url = f"{HKGOLDEN_API['BASE_URL']}/v1/topics/search"
+        params = {
+            "s": api_key,
+            "q": str(thread_id),
+            "page": "1",
+            "count": "30",
+            "user_id": "0",
+            "block": "Y",
+            "sensormode": "N",
+            "filterMode": "N",
+            "returntype": "json"
+        }
+    
     async with aiohttp.ClientSession() as session:
         try:
-            async with session.get(url, headers=headers) as response:
+            async with session.get(url, headers=headers, params=params if platform == "HKGOLDEN" else None) as response:
                 if response.status != 200:
                     logger.error(f"搜尋帖子失敗: platform={platform}, thread_id={thread_id}, 狀態碼={response.status}")
                     return None
@@ -54,7 +74,6 @@ async def search_thread_by_id(thread_id, platform):
 async def test_page():
     st.title("討論區數據測試頁面")
     
-    # 初始化速率限制狀態
     if "rate_limit_until" not in st.session_state:
         st.session_state.rate_limit_until = 0
     if "request_counter" not in st.session_state:
@@ -64,7 +83,6 @@ async def test_page():
     if "thread_content_cache" not in st.session_state:
         st.session_state.thread_content_cache = {}
     
-    # 檢查是否處於速率限制中
     if time.time() < st.session_state.rate_limit_until:
         st.error(f"API 速率限制中，請在 {datetime.fromtimestamp(st.session_state.rate_limit_until, tz=HONG_KONG_TZ).strftime('%Y-%m-%d %H:%M:%S')} 後重試。")
         return

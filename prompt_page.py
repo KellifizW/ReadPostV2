@@ -1,4 +1,3 @@
-```python
 import streamlit as st
 import asyncio
 from datetime import datetime
@@ -49,6 +48,37 @@ async def prompt_page():
     # 顯示 prompt 記錄
     st.markdown("### Prompt 記錄")
     for prompt_entry in st.session_state.prompt_history:
+        with st.chat_message("user"):
+            st.markdown(f"**用戶**：{prompt_entry['question']}")
+        with st.chat_message("assistant"):
+            st.markdown("**Prompt**：")
+            st.code(prompt_entry['prompt'], language="text")
+            if prompt_entry.get("debug_info"):
+                with st.expander("調試信息"):
+                    for info in prompt_entry["debug_info"]:
+                        st.markdown(info)
+    
+    # 用戶輸入
+    user_input = st.chat_input("輸入你的問題或要求（例如：分享任何帖文）")
+    
+    if user_input and not st.session_state.input_processed:
+        logger.info(f"Processing user input: question={user_input}, platform={platform}, category={selected_cat}")
+        
+        # 檢查重複提交
+        submit_key = f"{user_input}:{platform}:{selected_cat}"
+        current_time = time.time()
+        if (st.session_state.last_submit_key == submit_key and 
+            current_time - st.session_state.last_submit_time < 5):
+            logger.warning("Skipping duplicate prompt submission")
+            st.warning("請勿重複提交相同請求，請稍後再試。")
+            return
+        
+        # 標記輸入已處理
+        st.session_state.input_processed = True
+        st.session_state.last_submit_key = submit_key
+        st.session_state.last_submit_time = current_time
+
+        # 顯示用戶輸入
         with st.chat_message("user"):
             st.markdown(f"**用戶**：{prompt_entry['question']}")
         with st.chat_message("assistant"):
@@ -150,4 +180,3 @@ async def prompt_page():
     # 重置輸入狀態（在每次渲染結束後）
     if not user_input:
         st.session_state.input_processed = False
-```

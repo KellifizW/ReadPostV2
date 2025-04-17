@@ -263,3 +263,80 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
 - 意圖：{analysis['intent']}
 - 數據類型：{', '.join(analysis['data_types'])}
 - 篩選條件：{analysis['filter_condition']}
+
+帖子數據：
+"""
+    for thread in threads_data:
+        prompt += f"""
+- 帖子 ID：{thread['thread_id']}
+- 標題：{thread['title']}
+- 回覆（前 {len(thread['replies'])} 條）：
+"""
+        for reply in thread["replies"]:
+            content = reply["content"][:100] + '...' if len(reply["content"]) > 100 else reply["content"]
+            prompt += f"  - {content}（正評：{reply['like_count']}，負評：{reply['dislike_count']}）\n"
+    
+    prompt += f"""
+根據用戶問題和帖子數據，生成一段簡潔的分享文字（必須嚴格限制在280字以內，僅包含 {{ output }} 部分的內容），突出帖子的吸引之處，並包含標題和首條回覆的片段（若有）。
+
+範例：
+{{ output }}
+熱門 {platform} 帖子！"{threads_data[0]['title'][:50] if threads_data else '無標題'}" 引發熱議。首條回覆："{threads_data[0]['replies'][0]['content'][:50] if threads_data and threads_data[0]['replies'] else '無回覆'}"。快來看看！
+{{ output }}
+"""
+    
+    logger.info(f"Generated prompt (length={len(prompt)} chars)")
+    
+    if return_prompt:
+        result = {
+            "response": prompt,
+            "rate_limit_info": rate_limit_info,
+            "processed_data": processed_data,
+            "analysis": analysis
+        }
+        active_requests[request_key]["result"] = result
+        return result
+    
+    # 調用Grok 3生成回應
+    start_api_time = time.time()
+    api_result = await call_grok3_api(prompt)
+    api_elapsed = time.time() - start_api_time
+    logger.info(f"Grok 3 API call completed: elapsed={api_elapsed:.2f}s")
+    
+    if api_result.get("status") == "error":
+        logger.warning(f"Falling back to local response due to Grok 3 API failure: {api_result['content']}")
+        response = f"""
+熱門帖子來自 {platform}！問題意圖：{analysis['intent']}。
+"""
+        for thread in threads_data[:1]:
+            first_reply = thread["replies"][0]["content"][:50] if thread["replies"] else "無回覆"
+            response += f"""
+- "{thread['title'][:50]}" 引發討論。首條回覆："{first_reply}"。
+詳細：
+- ID：{thread['thread_id']}
+- 標題：{thread['title']}
+"""
+            for i, reply in enumerate(thread["replies"][:3], 1):
+                response += f"\n回覆 {i}：{reply['content'][:50]}...\n正評：{reply['like_count']}，負評：{reply['dislike_count']}\n"
+        response = response[:280]
+    else:
+        # 提取 {{ output }} 部分並截斷
+        content = api_result["content"].strip()
+        match = re.search(r'\{\{ output \}\}(.*?)\{\{ output \}\}', content, re.DOTALL)
+        response = match.group(1).strip()[:280] if match else content[:280]
+    
+    result = {
+        "response": response,
+        "rate_limit_info": rate_limit_info,
+        "processed_data": processed_data,
+        "analysis": analysis
+    }
+    
+    with processing_lock:
+        active_requests[request_key]["result"] = result
+        if current_time - active_requests[request_key]["timestamp"] > 30:
+            del active_requests[request_key]
+    
+    logger.info(f"Processed question: question={question}, platform={platform}, response_length={len(response)}")
+    
+    return result

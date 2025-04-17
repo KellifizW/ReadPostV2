@@ -6,7 +6,7 @@ import streamlit as st
 import streamlit.logger
 import time
 import random
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 from config import LIHKG_API, HKGOLDEN_API
 from grok3_client import call_grok3_api
@@ -102,7 +102,7 @@ async def analyze_user_question(question, platform):
         data_types = ["title", "no_of_reply", "last_reply_time", "like_count", "dislike_count", "replies"]
         num_threads = 5
         reply_strategy = "最新20條"
-        filter_condition = "按回覆數量排序，標題或回覆包含‘on9’或搞笑、荒謬、惡搞、迷因相關內容，優先今日帖子但允許最近三天"
+        filter_condition = "按回覆數量排序，標題或回覆包含‘on9’或搞笑、荒謬、惡搞、迷因、傻、無語、荒唐相關內容，優先今日帖子但允許最近三天"
     
     if "今日" in question.lower():
         filter_condition = f"{filter_condition}; 優先選擇今日發布的帖子，若無則放寬至最近三天"
@@ -141,26 +141,38 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
     logger.info(f"Fetching threads with reply_strategy={analysis['reply_strategy']}")
     
     start_fetch_time = time.time()
-    if platform == "LIHKG":
-        result = await get_lihkg_topic_list(
-            cat_id=cat_id,
-            sub_cat_id=0,
-            start_page=1,
-            max_pages=max_pages,
-            request_counter=st.session_state.get("request_counter", 0),
-            last_reset=st.session_state.get("last_reset", time.time()),
-            rate_limit_until=st.session_state.get("rate_limit_until", 0)
-        )
-    else:
-        result = await get_hkgolden_topic_list(
-            cat_id=cat_id,
-            sub_cat_id=0,
-            start_page=1,
-            max_pages=max_pages,
-            request_counter=st.session_state.get("request_counter", 0),
-            last_reset=st.session_state.get("last_reset", time.time()),
-            rate_limit_until=st.session_state.get("rate_limit_until", 0)
-        )
+    try:
+        if platform == "LIHKG":
+            result = await get_lihkg_topic_list(
+                cat_id=cat_id,
+                sub_cat_id=0,
+                start_page=1,
+                max_pages=max_pages,
+                request_counter=st.session_state.get("request_counter", 0),
+                last_reset=st.session_state.get("last_reset", time.time()),
+                rate_limit_until=st.session_state.get("rate_limit_until", 0)
+            )
+        else:
+            result = await get_hkgolden_topic_list(
+                cat_id=cat_id,
+                sub_cat_id=0,
+                start_page=1,
+                max_pages=max_pages,
+                request_counter=st.session_state.get("request_counter", 0),
+                last_reset=st.session_state.get("last_reset", time.time()),
+                rate_limit_until=st.session_state.get("rate_limit_until", 0)
+            )
+    except Exception as e:
+        logger.error(f"Failed to fetch topics: error={str(e)}")
+        result = {
+            "response": f"無法抓取帖子，API 錯誤：{str(e)}。請稍後重試。",
+            "rate_limit_info": [],
+            "processed_data": [],
+            "analysis": analysis
+        }
+        with processing_lock:
+            active_requests[request_key]["result"] = result
+        return result
     
     items = result["items"]
     rate_limit_info = result["rate_limit_info"]
@@ -168,7 +180,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
     st.session_state.last_reset = result["last_reset"]
     st.session_state.rate_limit_until = result["rate_limit_until"]
     
-    logger.info(f"Fetch completed: platform={platform}, CATEGORY={selected_cat}, total_items={len(items)}, elapsed={time.time() - start_fetch_time:.2f}s")
+    logger.info(f"Fetch completed: platform={platform}, category={selected_cat}, total_items={len(items)}, elapsed={time.time() - start_fetch_time:.2f}s")
     
     if not items:
         logger.error("No items fetched from API")
@@ -180,12 +192,16 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
         }
         with processing_lock:
             active_requests[request_key]["result"] = result
-            return result
+        return result
     
     selected_items = []
     filter_condition = analysis["filter_condition"].lower()
     today = datetime.now(HONG_KONG_TZ).date()
-    three_days_ago = today - timedelta(days=3)
+    try:
+        three_days_ago = today - timedelta(days=3)
+    except Exception as e:
+        logger.error(f"Failed to calculate date range: error={str(e)}")
+        three_days_ago = today  # 回退至僅今日
     
     filtered_items = []
     for item in items:
@@ -194,17 +210,14 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
         no_of_reply = item.get("no_of_reply", 0)
         title = item.get("title", "").lower()
         if last_reply_time and no_of_reply > 0:
-            create_date = datetime.fromtimestamp(create_time, tz=HONG_KONG_TZ).date() if create_time else None
-            # 放寬至最近三天
+            create_date = datetime.fromtimestamp(create_time, tz=HONG_KONG_TZ).date() if create_time else today
             if "優先選擇今日發布的帖子" in filter_condition and create_date < three_days_ago:
                 continue
-            # 檢查「On9」相關內容（標題）
-            if "on9" in filter_condition and ("on9" in title or any(kw in title for kw in ["搞笑", "荒謬", "無語", "惡搞", "迷因", "搞亂"])):
+            if "on9" in filter_condition and ("on9" in title or any(kw in title for kw in ["搞笑", "荒謬", "無語", "惡搞", "迷因", "傻", "荒唐"])):
                 filtered_items.append(item)
             else:
                 filtered_items.append(item)
     
-    # 按回覆數排序
     if "按回覆數量排序" in filter_condition:
         selected_items = sorted(
             filtered_items,
@@ -260,24 +273,28 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
                 thread_max_replies = min(no_of_reply, 20) if "最新20條" in analysis["reply_strategy"] else no_of_reply
                 logger.info(f"Fetching thread content: thread_id={thread_id}, platform={platform}, max_replies={thread_max_replies}")
                 
-                if platform == "LIHKG":
-                    thread_result = await get_lihkg_thread_content(
-                        thread_id=thread_id,
-                        cat_id=cat_id,
-                        request_counter=st.session_state.request_counter,
-                        last_reset=st.session_state.last_reset,
-                        rate_limit_until=st.session_state.rate_limit_until,
-                        max_replies=thread_max_replies
-                    )
-                else:
-                    thread_result = await get_hkgolden_thread_content(
-                        thread_id=thread_id,
-                        cat_id=cat_id,
-                        request_counter=st.session_state.request_counter,
-                        last_reset=st.session_state.last_reset,
-                        rate_limit_until=st.session_state.rate_limit_until,
-                        max_replies=thread_max_replies
-                    )
+                try:
+                    if platform == "LIHKG":
+                        thread_result = await get_lihkg_thread_content(
+                            thread_id=thread_id,
+                            cat_id=cat_id,
+                            request_counter=st.session_state.request_counter,
+                            last_reset=st.session_state.last_reset,
+                            rate_limit_until=st.session_state.rate_limit_until,
+                            max_replies=thread_max_replies
+                        )
+                    else:
+                        thread_result = await get_hkgolden_thread_content(
+                            thread_id=thread_id,
+                            cat_id=cat_id,
+                            request_counter=st.session_state.request_counter,
+                            last_reset=st.session_state.last_reset,
+                            rate_limit_until=st.session_state.rate_limit_until,
+                            max_replies=thread_max_replies
+                        )
+                except Exception as e:
+                    logger.error(f"Failed to fetch thread content: thread_id={thread_id}, error={str(e)}")
+                    continue
                 
                 replies = thread_result["replies"]
                 thread_title = thread_result["title"] or thread_title
@@ -291,7 +308,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
                 valid_replies = []
                 for reply in replies:
                     cleaned_text = clean_reply_text(reply["msg"])
-                    if cleaned_text and any(kw in cleaned_text.lower() for kw in ["on9", "搞笑", "荒謬", "無語", "惡搞", "迷因", "搞亂"]):
+                    if cleaned_text and any(kw in cleaned_text.lower() for kw in ["on9", "搞笑", "荒謬", "無語", "惡搞", "迷因", "傻", "荒唐"]):
                         valid_replies.append({"content": cleaned_text})
                 
                 thread_data = {
@@ -360,7 +377,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
 - 負評數：{thread['dislike_count']}
 """
         if thread["replies"]:
-            prompt += f"- 回覆（共 {len(thread['replies'])} 條，篩選後僅保留含‘On9’或搞笑相關內容）：\n"
+            prompt += f"- 回覆（共 {len(thread['replies'])} 條，篩選後僅保留含‘on9’或搞笑相關內容）：\n"
             max_replies = len(thread["replies"])
             reply_count = 0
             for reply in thread["replies"]:
@@ -377,8 +394,8 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
     
     prompt += f"""
 請完成以下任務：
-1. 生成一段簡潔的分享或排列文字，嚴格限制在 {share_text_limit} 字以內，列出 {analysis['num_threads']} 個帖子，按回覆數量降序排列，包含每個帖子的標題、回覆數量、最後回覆時間、點讚數和負評數。針對「On9」問題，總結每個帖子的「On9」特質（例如搞笑、荒謬、爭議性內容），基於回覆內容分析主要觀點、情緒或熱門話題。
-2. 提供一段簡短的選擇理由（{reason_limit} 字以內），解釋為何選擇這些帖子（例如話題性、符合「On9」特質、近期熱度等）。
+1. 生成一段簡潔的分享或排列文字，嚴格限制在 {share_text_limit} 字以內，列出 {analysis['num_threads']} 個帖子，按回覆數量降序排列，包含每個帖子的標題、回覆數量、最後回覆時間、點讚數和負評數。針對「on9」問題，總結每個帖子的「on9」特質（例如搞笑、荒謬、爭議性內容），基於回覆內容分析主要觀點、情緒或熱門話題。
+2. 提供一段簡短的選擇理由（{reason_limit} 字以內），解釋為何選擇這些帖子（例如話題性、符合「on9」特質、近期熱度等）。
 3. 若回覆數量過多，根據回覆策略（{analysis['reply_strategy']}）優先總結最新或最相關的回覆內容。
 
 回應格式：
@@ -409,10 +426,14 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
     async def stream_response():
         if api_result.get("status") == "error":
             logger.warning(f"Stream failed: request_key={request_key}, error={api_result['content']}")
-            # 回退到同步模式
-            api_result_sync = await call_grok3_api(prompt, stream=False)
-            api_elapsed = time.time() - start_api_time
-            logger.info(f"Grok 3 API retry completed: elapsed={api_elapsed:.2f}s")
+            for attempt in range(2):
+                api_result_sync = await call_grok3_api(prompt, stream=False)
+                api_elapsed = time.time() - start_api_time
+                logger.info(f"Grok 3 API retry completed: elapsed={api_elapsed:.2f}s")
+                
+                if api_result_sync.get("status") != "error":
+                    break
+                logger.warning(f"Retry {attempt+1} failed: {api_result_sync['content']}")
             
             if api_result_sync.get("status") == "error":
                 logger.error(f"Retry failed: request_key={request_key}, error={api_result_sync['content']}")
@@ -444,7 +465,6 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
             if chunk:
                 logger.debug(f"Received chunk: {chunk[:50]}...")
                 try:
-                    # 解析 xAI 流式 JSON
                     if chunk.strip() == "data: [DONE]":
                         break
                     if chunk.strip().startswith("data:"):
@@ -457,7 +477,6 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
                     logger.warning(f"Failed to parse JSON chunk: {chunk}, error={str(e)}")
                     continue
                 
-                # 每 10-50 字或換行 yield 一塊
                 while "\n" in buffer or len(buffer) >= 50:
                     if "\n" in buffer:
                         line, buffer = buffer.split("\n", 1)

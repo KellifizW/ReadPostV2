@@ -245,7 +245,7 @@ async def chat_page():
             response_text = ""
             try:
                 if isinstance(response, str):
-                    # 直接處理字符串回應
+                    # 處理字符串回應
                     response = response.strip()
                     response = re.sub(r'\{\{ output \}\}|\{ output \}', '', response).strip()
                     
@@ -263,21 +263,41 @@ async def chat_page():
                     response_text = f"**分享文字**：{share_text}\n\n**選擇理由**：{reason}"
                     placeholder.markdown(response_text)
                 else:
-                    # 處理生成器，逐塊顯示並收集字符串
+                    # 使用 st.write_stream 處理生成器
                     full_response = []
                     try:
-                        async for chunk in response:  # 直接迭代生成器
-                            if isinstance(chunk, str):
-                                full_response.append(chunk)
-                                placeholder.markdown("".join(full_response), unsafe_allow_html=True)
-                                await asyncio.sleep(0.05)  # 模擬打字機效果
-                            else:
-                                logger.warning(f"Non-string chunk received: {chunk}")
-                                full_response.append(str(chunk))
-                        response_text = "".join(full_response)
-                        if not response_text:
-                            response_text = "無回應內容，請稍後重試。"
-                            placeholder.markdown(response_text)
+                        # 將異步生成器轉為同步迭代器
+                        def sync_generator():
+                            loop = asyncio.new_event_loop()
+                            asyncio.set_event_loop(loop)
+                            try:
+                                while True:
+                                    try:
+                                        future = asyncio.ensure_future(response.__anext__())
+                                        chunk = loop.run_until_complete(future)
+                                        if isinstance(chunk, str):
+                                            yield chunk
+                                        else:
+                                            logger.warning(f"Non-string chunk received: {chunk}")
+                                            yield str(chunk)
+                                    except StopAsyncIteration:
+                                        break
+                                    except Exception as e:
+                                        yield f"無法顯示回應，API 連接失敗：{str(e)}。請稍後重試。\n"
+                                        break
+                            finally:
+                                loop.close()
+                        
+                        # 使用 st.write_stream 迭代並收集結果
+                        response_text = st.write_stream(sync_generator())
+                        if isinstance(response_text, str):
+                            full_response.append(response_text)
+                        elif isinstance(response_text, list):
+                            full_response.extend(response_text)
+                        
+                        # 確保非空回應
+                        response_text = "".join(str(item) for item in full_response) if full_response else "無回應內容，請稍後重試。"
+                        placeholder.markdown(response_text)
                     except Exception as e:
                         debug_info.append(f"#### 調試信息：\n- 流式處理錯誤: 原因={str(e)}")
                         error_message = f"無法顯示回應，API 連接失敗：{str(e)}。請稍後重試。"

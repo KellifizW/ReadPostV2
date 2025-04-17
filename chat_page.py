@@ -81,7 +81,7 @@ async def chat_page():
 
     # 處理預覽按鈕
     if preview_button and user_input:
-        logger.info(f"Generating prompt preview: question={user_input}, platform={platform}, category={selected_cat}")
+        logger.info(f"Preview button clicked: question={user_input}, platform={platform}, category={selected_cat}")
         
         # 檢查重複提交
         submit_key = f"preview:{user_input}:{platform}:{selected_cat}"

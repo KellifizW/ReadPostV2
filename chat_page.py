@@ -244,23 +244,26 @@ async def chat_page():
                         "timestamp": time.time()
                     }
                     
-                    # 流式顯示回應
                     response = result.get("response", "無回應內容")
                     response = re.sub(r'\{\{ output \}\}|\{ output \}', '', response).strip()
                     
                     def stream_response():
+                        buffer = ""
                         share_text = "無分享文字"
                         reason = "無選擇理由"
                         
-                        share_match = re.search(r'分享文字：\s*(.*?)(?=\n選擇理由：|\Z)', response, re.DOTALL)
-                        reason_match = re.search(r'選擇理由：\s*(.*)', response, re.DOTALL)
-                        
-                        if share_match:
-                            share_text = share_match.group(1).strip()
-                            yield f"**分享文字**：{share_text}\n"
-                        if reason_match:
-                            reason = reason_match.group(1).strip()
-                            yield f"**選擇理由**：{reason}\n"
+                        # 模擬流式顯示（實際 chunk 在 data_processor.py 處理）
+                        for chunk in [response[i:i+50] for i in range(0, len(response), 50)]:
+                            buffer += chunk
+                            share_match = re.search(r'分享文字：\s*(.*?)(?=\n選擇理由：|\Z)', buffer, re.DOTALL)
+                            reason_match = re.search(r'選擇理由：\s*(.*)', buffer, re.DOTALL)
+                            
+                            if share_match and share_text == "無分享文字":
+                                share_text = share_match.group(1).strip()
+                                yield f"**分享文字**：{share_text}\n"
+                            if reason_match and reason == "無選擇理由":
+                                reason = reason_match.group(1).strip()
+                                yield f"**選擇理由**：{reason}\n"
                     
                     placeholder.write_stream(stream_response)
                 except Exception as e:

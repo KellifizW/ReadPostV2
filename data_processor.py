@@ -93,8 +93,9 @@ async def analyze_user_question(question, platform):
         elif line.startswith("篩選條件:"):
             filter_condition = line.replace("篩選條件:", "").strip()
     
-    # 如果意圖涉及「最多回覆」，設置 num_replies 為最大值
-    if "最多回覆" in intent or "回覆數量最多" in intent:
+    # 改進意圖解析，確保「最多回覆」設置 num_replies=100
+    if "最多回覆" in content or "回覆數量最多" in content:
+        intent = "尋找回覆數量最多的帖子"
         num_replies = 100
         filter_condition = "按回覆數量由高到低排序"
         data_types.extend(["last_reply_time", "like_count", "dislike_count"])
@@ -180,11 +181,23 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
     filter_condition = analysis["filter_condition"].lower()
     if filter_condition != "none":
         if "回覆數量由高到低" in filter_condition:
-            selected_items = sorted(
-                [item for item in items if item.get("no_of_reply", 0) > 0],
-                key=lambda x: x.get("no_of_reply", 0),
-                reverse=True
-            )[:analysis["num_threads"]]
+            # 優先選擇符合關鍵字的帖子
+            keywords = [k for k in filter_condition.split() if k in ["on9", "傻", "搞笑"]]
+            if keywords:
+                selected_items = [
+                    item for item in items
+                    if any(keyword.lower() in item["title"].lower() for keyword in keywords) and item.get("no_of_reply", 0) > 0
+                ]
+            # 若關鍵字匹配不足，選擇回覆數最多的帖子
+            if len(selected_items) < analysis["num_threads"]:
+                selected_items.extend(
+                    sorted(
+                        [item for item in items if item.get("no_of_reply", 0) > 0 and item not in selected_items],
+                        key=lambda x: x.get("no_of_reply", 0),
+                        reverse=True
+                    )
+                )
+            selected_items = selected_items[:analysis["num_threads"]]
         else:
             keywords = filter_condition.split()
             selected_items = [

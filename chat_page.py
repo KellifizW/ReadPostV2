@@ -3,7 +3,7 @@ import asyncio
 from datetime import datetime
 import pytz
 from data_processor import process_user_question
-from grok3_client import stream_grok3_response
+from grok3_client import call_grok3_api
 import time
 from config import LIHKG_API, HKGOLDEN_API, GENERAL
 import streamlit.logger
@@ -93,18 +93,18 @@ async def chat_page():
                     }
                 except Exception as e:
                     result = {}
-                    debug_info = [f"#### 調試信息：\n- 處理錯誤: 原因={str(e)}"]
+                    debug_info = [f"#### 調試信息：\n- 處理錯誤: 原因={repr(e)}"]
                     if result.get("rate_limit_info"):
                         debug_info.append("- 速率限制或錯誤記錄：")
                         debug_info.extend(f"  - {info}" for info in result["rate_limit_info"])
-                    error_message = f"處理失敗，原因：{str(e)}"
+                    error_message = f"處理失敗，原因：{repr(e)}"
                     placeholder.markdown(error_message)
                     st.session_state.chat_history.append({
                         "question": user_input,
                         "response": error_message,
                         "debug_info": debug_info
                     })
-                    logger.error(f"Processing failed: question={user_input}, platform={platform}, error={str(e)}")
+                    logger.error(f"Processing failed: question={user_input}, platform={platform}, error={repr(e)}")
                     return
             
             response = result.get("response", "無回應內容")

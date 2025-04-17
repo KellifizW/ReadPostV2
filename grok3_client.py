@@ -1,3 +1,4 @@
+import streamlit as st
 import streamlit.logger
 import aiohttp
 import asyncio
@@ -11,13 +12,21 @@ async def stream_grok3_response(prompt: str) -> AsyncGenerator[str, None]:
     """Stream response from Grok 3 API"""
     logger.info(f"Sending Grok 3 prompt: {prompt}")
     
-    if not GROK3_API["API_KEY"]:
+    # 動態從 st.secrets 獲取 API 密鑰
+    try:
+        api_key = st.secrets["grok3key"]
+    except KeyError:
         logger.error("Grok 3 API key is missing in Streamlit secrets (grok3key).")
         yield "Error: Grok 3 API key is missing. Please configure 'grok3key' in Streamlit secrets."
         return
     
+    if not api_key:
+        logger.error("Grok 3 API key is empty in Streamlit secrets (grok3key).")
+        yield "Error: Grok 3 API key is empty. Please configure a valid 'grok3key' in Streamlit secrets."
+        return
+    
     headers = {
-        "Authorization": f"Bearer {GROK3_API['API_KEY']}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "Accept": "application/json"
     }

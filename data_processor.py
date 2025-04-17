@@ -164,8 +164,9 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
             "processed_data": [],
             "analysis": analysis
         }
-        active_requests[request_key]["result"] = result
-        return result
+        with processing_lock:
+            active_requests[request_key]["result"] = result
+            return result
     
     # 根據篩選條件選擇帖子
     selected_items = []
@@ -277,7 +278,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
             prompt += f"  - {content}（正評：{reply['like_count']}，負評：{reply['dislike_count']}）\n"
     
     prompt += f"""
-根據用戶問題和帖子數據，生成一段簡潔的分享文字（必須嚴格限制在280字以內，僅包含 {{ output }} 部分的內容），突出帖子的吸引之處，並包含標題和首條回覆的片段（若有）。
+根據用戶問題和帖子數據，生成一段簡潔的分享文字，必須嚴格限制在280字以內，且僅返回 {{ output }} 部分的內容，突出帖子的吸引之處，包含標題和首條回覆的片段（若有）。
 
 範例：
 {{ output }}
@@ -294,7 +295,8 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
             "processed_data": processed_data,
             "analysis": analysis
         }
-        active_requests[request_key]["result"] = result
+        with processing_lock:
+            active_requests[request_key]["result"] = result
         return result
     
     # 調用Grok 3生成回應
@@ -312,12 +314,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
             first_reply = thread["replies"][0]["content"][:50] if thread["replies"] else "無回覆"
             response += f"""
 - "{thread['title'][:50]}" 引發討論。首條回覆："{first_reply}"。
-詳細：
-- ID：{thread['thread_id']}
-- 標題：{thread['title']}
 """
-            for i, reply in enumerate(thread["replies"][:3], 1):
-                response += f"\n回覆 {i}：{reply['content'][:50]}...\n正評：{reply['like_count']}，負評：{reply['dislike_count']}\n"
         response = response[:280]
     else:
         # 提取 {{ output }} 部分並截斷

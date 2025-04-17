@@ -1,7 +1,9 @@
 import aiohttp
 import asyncio
+import streamlit as st
 import streamlit.logger
 import uuid
+import os
 from config import GROK3_API
 
 logger = streamlit.logger.get_logger(__name__)
@@ -13,9 +15,12 @@ async def call_grok3_api(prompt):
     
     try:
         api_key = st.secrets["grok3key"]
-    except KeyError:
-        logger.error(f"Grok 3 API key missing: request_id={request_id}")
-        return {"status": "error", "content": "Grok 3 API key is missing"}
+    except (KeyError, AttributeError):
+        logger.warning(f"st.secrets['grok3key'] not found, trying environment variable: request_id={request_id}")
+        api_key = os.getenv("GROK3_API_KEY")
+        if not api_key:
+            logger.error(f"Grok 3 API key missing: request_id={request_id}")
+            return {"status": "error", "content": "Grok 3 API key is missing"}
 
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -37,11 +42,11 @@ async def call_grok3_api(prompt):
                 f"{GROK3_API['BASE_URL']}/chat/completions",
                 headers=headers,
                 json=payload,
-                timeout=180
+                timeout=60  # 縮短超時時間
             ) as response:
                 response_text = await response.text()
                 if response.status != 200:
-                    logger.error(f"Grok 3 API failed: request_id={request_id}, status={response.status}, response={response_text}")
+                    logger.error(f"Grok 3 API failed: request_id={request_id}, status={response.status}, response={response_text[:200]}...")
                     return {"status": "error", "content": f"API request failed with status {response.status}"}
                 
                 data = await response.json()

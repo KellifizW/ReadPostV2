@@ -16,12 +16,11 @@ from threading import Lock
 logger = streamlit.logger.get_logger(__name__)
 processing_lock = Lock()
 active_requests = {}
-MAX_PROMPT_LENGTH = 30000  # 假設 Grok 3 API 輸入限制為 30,000 字元
-THREAD_ID_CACHE_DURATION = 300  # 帖子 ID 緩存有效期：5 分鐘（300 秒）
+MAX_PROMPT_LENGTH = 30000
+THREAD_ID_CACHE_DURATION = 300
 HONG_KONG_TZ = pytz.timezone("Asia/Hong_Kong")
 
 def clean_expired_cache(platform):
-    """清理過期緩存，包括查詢緩存和帖子 ID 緩存"""
     cache_duration = LIHKG_API["CACHE_DURATION"] if platform == "LIHKG" else HKGOLDEN_API["CACHE_DURATION"]
     current_time = time.time()
     for cache_key in list(st.session_state.thread_content_cache.keys()):
@@ -32,7 +31,6 @@ def clean_expired_cache(platform):
             del st.session_state.thread_id_cache[thread_id]
 
 def clean_reply_text(text):
-    """清理回覆中的 HTML 標籤並檢查長度，忽略 ≤ 5 個字的回覆"""
     text = re.sub(r'<img[^>]+alt="\[([^\]]+)\]"[^>]*>', r'[\1]', text)
     text = clean_html(text)
     text = ' '.join(text.split())
@@ -41,7 +39,6 @@ def clean_reply_text(text):
     return text
 
 async def analyze_user_question(question, platform):
-    """使用 Grok 3 分析用戶問題，決定需要抓取的數據類型和數量"""
     prompt = f"""
 你是一個智能助手，分析用戶問題以決定從討論區（{platform}）抓取哪些元數據。
 用戶問題："{question}"
@@ -61,7 +58,7 @@ async def analyze_user_question(question, platform):
 - 篩選條件: [描述或"無"]
 """
     logger.info(f"Analyzing user question: question={question}, platform={platform}")
-    api_result = await call_grok3_api(prompt)
+    api_result = await call_grok3_api(prompt, stream=False)
     
     if api_result.get("status") == "error":
         logger.error(f"Failed to analyze question: {api_result['content']}")
@@ -76,7 +73,6 @@ async def analyze_user_question(question, platform):
     content = api_result["content"].strip()
     logger.info(f"Analysis result: {content[:200]}...")
     
-    # 解析回應
     intent = "unknown"
     data_types = ["title", "no_of_reply", "last_reply_time", "replies"]
     num_threads = 1
@@ -100,20 +96,19 @@ async def analyze_user_question(question, platform):
             filter_condition = line.replace("篩選條件:", "").strip()
     
     # 改進意圖解析
-    if "分享" in question.lower() and "個" in question:
-        match = re.search(r'(\d+)個', question)
-        if match:
-            num_threads = min(max(int(match.group(1)), 1), 5)
-            intent = f"分享{num_threads}個指定帖子"
+    if "分享" in question.lower():
+        if "幾個" in question.lower():
+            num_threads = max(num_threads, 3)  # 默認「幾個」為 3
+            intent = "分享最新帖子"
+        elif "個" in question:
+            match = re.search(r'(\d+)個', question)
+            if match:
+                num_threads = min(max(int(match.group(1)), 1), 5)
+                intent = f"分享{num_threads}個指定帖子"
     if "最新" in question.lower():
         intent = "分享最新帖子"
         filter_condition = "按最後回覆時間排序，選擇最新的帖子"
         data_types.extend(["last_reply_time", "like_count", "dislike_count"])
-        reply_strategy = "總結最新50條回覆"
-    if "最多人睇" in question.lower():
-        intent = "分享最多人觀看的帖子"
-        filter_condition = "按回覆數量或點讚數排序，選擇最熱門的帖子"
-        data_types.extend(["like_count", "dislike_count"])
         reply_strategy = "總結最新50條回覆"
     
     return {
@@ -125,7 +120,6 @@ async def analyze_user_question(question, platform):
     }
 
 async def process_user_question(question, platform, cat_id_map, selected_cat, return_prompt=False):
-    """處理用戶問題並返回相關帖子數據或原始 prompt"""
     request_key = f"{question}:{platform}:{selected_cat}:{'preview' if return_prompt else 'normal'}"
     current_time = time.time()
     
@@ -136,14 +130,13 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
         
         active_requests[request_key] = {"timestamp": current_time, "result": None}
     
-    logger.info(f"Starting to process question: request_key={request_key}")
+    logger.info(f"Starting to process question: request_key={request_key}, hk_time={datetime.now(HONG_KONG_TZ).strftime('%Y-%m-%d %H:%M:%S')}")
     
     if "thread_id_cache" not in st.session_state:
         st.session_state.thread_id_cache = {}
     
     clean_expired_cache(platform)
     
-    # 分析用戶問題
     analysis = await analyze_user_question(question, platform)
     logger.info(f"Question analysis: intent={analysis['intent']}, num_threads={analysis['num_threads']}, reply_strategy={analysis['reply_strategy']}")
     
@@ -151,7 +144,6 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
     max_pages = max(5, analysis["num_threads"])
     logger.info(f"Fetching threads with reply_strategy={analysis['reply_strategy']}")
     
-    # 抓取帖子列表
     start_fetch_time = time.time()
     if platform == "LIHKG":
         result = await get_lihkg_topic_list(
@@ -194,54 +186,32 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
             active_requests[request_key]["result"] = result
             return result
     
-    # 根據篩選條件選擇帖子
+    # 選擇帖子
     selected_items = []
     filter_condition = analysis["filter_condition"].lower()
-    today = datetime.now(HONG_KONG_TZ).date()
     
     if filter_condition != "none":
-        today_items = []
-        other_items = []
+        filtered_items = []
         for item in items:
             last_reply_time = item.get("last_reply_time", 0)
-            if last_reply_time:
-                try:
-                    reply_date = datetime.fromtimestamp(last_reply_time, tz=HONG_KONG_TZ).date()
-                    if reply_date == today:
-                        today_items.append(item)
-                    else:
-                        other_items.append(item)
-                except ValueError:
-                    other_items.append(item)
+            no_of_reply = item.get("no_of_reply", 0)
+            if last_reply_time and no_of_reply >= 10:  # 放寬過濾，要求至少10條回覆
+                filtered_items.append(item)
             else:
-                other_items.append(item)
+                logger.info(f"Filtered out thread: id={item.get('id')}, last_reply_time={last_reply_time}, no_of_reply={no_of_reply}")
         
         if "最新" in filter_condition:
             selected_items = sorted(
-                items,
+                filtered_items,
                 key=lambda x: x.get("last_reply_time", 0),
                 reverse=True
             )
-        elif "今日" in filter_condition:
-            selected_items = sorted(
-                today_items,
-                key=lambda x: x.get("no_of_reply", 0) + x.get("like_count", 0) - x.get("dislike_count", 0),
-                reverse=True
-            )
-            if len(selected_items) < analysis["num_threads"]:
-                selected_items.extend(
-                    sorted(
-                        other_items,
-                        key=lambda x: x.get("no_of_reply", 0) + x.get("like_count", 0) - x.get("dislike_count", 0),
-                        reverse=True
-                    )
-                )
         
         selected_items = selected_items[:analysis["num_threads"]]
     
     if not selected_items:
         selected_items = sorted(
-            [item for item in items if item.get("no_of_reply", 0) > 0],
+            [item for item in items if item.get("no_of_reply", 0) >= 10],
             key=lambda x: x.get("last_reply_time", 0),
             reverse=True
         )[:analysis["num_threads"]]
@@ -249,10 +219,11 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
     if not selected_items:
         selected_items = items[:analysis["num_threads"]]
     
+    logger.info(f"Selected {len(selected_items)} threads: {[item.get('id') for item in selected_items]}")
+    
     processed_data = []
     threads_data = []
     
-    # 抓取每個帖子的回覆
     for selected_item in selected_items:
         try:
             thread_id = selected_item["thread_id"] if platform == "LIHKG" else selected_item["id"]
@@ -274,12 +245,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
             total_replies = thread_data["total_replies"]
             rate_limit_info.extend(thread_data.get("rate_limit_info", []))
         else:
-            thread_max_replies = no_of_reply
-            if "最新" in analysis["reply_strategy"].lower():
-                match = re.search(r'最新(\d+)條', analysis["reply_strategy"])
-                if match:
-                    thread_max_replies = min(no_of_reply, int(match.group(1)))
-            
+            thread_max_replies = min(no_of_reply, 50) if "最新50條" in analysis["reply_strategy"] else no_of_reply
             logger.info(f"Fetching thread content: thread_id={thread_id}, platform={platform}, max_replies={thread_max_replies}")
             
             if platform == "LIHKG":
@@ -354,7 +320,6 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
             for reply in replies
         ])
     
-    # 計算動態回應字數
     prompt_length = 0
     if prompt_length <= 1000:
         share_text_limit = 150
@@ -366,7 +331,6 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
         share_text_limit = int(150 + (prompt_length - 1000) * (1500 - 150) / (20000 - 1000))
         reason_limit = int(50 + (prompt_length - 1000) * (500 - 50) / (20000 - 1000))
     
-    # 生成提示
     prompt = f"""
 你是一個智能助手，從 {platform}（{selected_cat} 分類）分享有趣的帖子。以下是用戶問題和分析結果，以及選定的帖子數據。
 
@@ -441,9 +405,9 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
             active_requests[request_key]["result"] = result
         return result
     
-    # 調用 Grok 3 生成回應
+    # 調用 Grok 3 生成回應（支持流式）
     start_api_time = time.time()
-    api_result = await call_grok3_api(prompt)
+    api_result = await call_grok3_api(prompt, stream=True)
     api_elapsed = time.time() - start_api_time
     logger.info(f"Grok 3 API call completed: elapsed={api_elapsed:.2f}s")
     
@@ -460,14 +424,20 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
         response = response[:share_text_limit]
         response += f"\n選擇理由：選擇這些帖子因其最新性和回覆數量多。"
     else:
-        content = api_result["content"].strip()
-        content = re.sub(r'\{\{ output \}\}', '', content).strip()
-        content = re.sub(r'^\s*選擇理由\s*[:：]?\s*', '', content, flags=re.MULTILINE).strip()
+        # 累積流式回應
+        content = ""
+        for chunk in api_result["content"]:
+            if chunk:
+                content += chunk
+                logger.debug(f"Received chunk: {chunk[:50]}...")
+        
+        logger.info(f"Raw API response: {content[:200]}...")
+        
+        content = re.sub(r'\{\{ output \}\}|\{ output \}', '', content).strip()
         
         share_text = "無分享文字"
         reason = "無選擇理由"
         
-        # 改進正則表達式，確保正確提取
         share_match = re.search(r'分享文字：\s*(.*?)(?=\n選擇理由：|\Z)', content, re.DOTALL)
         reason_match = re.search(r'選擇理由：\s*(.*)', content, re.DOTALL)
         
@@ -491,7 +461,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
         if current_time - active_requests[request_key]["timestamp"] > 30:
             del active_requests[request_key]
     
-    logger.info(f"Processed question: question={question}, platform={platform}, response_length={len(response)}")
+    logger.info(f"Processed question: question={question}, platform={platform}, response_length={len(response)}, hk_time={datetime.now(HONG_KONG_TZ).strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info(f"Selected {len(selected_items)} threads, total replies fetched: {sum(len(thread['replies']) for thread in threads_data)}")
     
     return result

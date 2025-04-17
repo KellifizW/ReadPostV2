@@ -5,12 +5,25 @@ import asyncio
 import json
 from typing import AsyncGenerator
 from config import GROK3_API
+import os
 
 logger = streamlit.logger.get_logger(__name__)
 
+def log_prompt_to_file(prompt: str):
+    """將完整 prompt 寫入日誌文件"""
+    try:
+        with open("prompts.log", "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Prompt:\n{prompt}\n{'-'*50}\n")
+    except Exception as e:
+        logger.error(f"Failed to write prompt to file: {str(e)}")
+
 async def stream_grok3_response(prompt: str) -> AsyncGenerator[str, None]:
     """Stream response from Grok 3 API"""
-    logger.info(f"Sending Grok 3 prompt: {prompt}")
+    # 分段記錄長 prompt
+    logger.info("Sending Grok 3 prompt (first 1000 chars):")
+    for i in range(0, len(prompt), 1000):
+        logger.info(prompt[i:i+1000])
+    log_prompt_to_file(prompt)  # 寫入日誌文件
     
     # 動態從 st.secrets 獲取 API 密鑰
     try:
@@ -47,8 +60,12 @@ async def stream_grok3_response(prompt: str) -> AsyncGenerator[str, None]:
                 timeout=30
             ) as response:
                 if response.status != 200:
-                    logger.error(f"Grok 3 API request failed: status={response.status}, reason={response.reason}")
-                    yield f"Error: API request failed with status {response.status}"
+                    error_msg = await response.text()
+                    logger.error(f"Grok 3 API request failed: status={response.status}, reason={error_msg}")
+                    if "token limit" in error_msg.lower():
+                        yield "Error: Prompt or response exceeds MAX_TOKENS limit. Please try again with a shorter prompt."
+                    else:
+                        yield f"Error: API request failed with status {response.status}"
                     return
                 
                 async for line in response.content:

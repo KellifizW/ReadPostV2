@@ -39,9 +39,9 @@ def clean_reply_text(text):
     text = ' '.join(text.split())
     return text
 
-async def process_user_question(question, platform, cat_id_map, selected_cat):
+async def process_user_question(question, platform, cat_id_map, selected_cat, min_replies):
     """處理用戶問題並返回相關帖子數據"""
-    request_key = f"{question}:{platform}:{selected_cat}"
+    request_key = f"{question}:{platform}:{selected_cat}:{min_replies}"
     current_time = time.time()
     
     with processing_lock:
@@ -55,7 +55,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat):
                 "processed_data": []
             })
     
-    logger.info(f"Starting to process question: question={question}, platform={platform}, category={selected_cat}")
+    logger.info(f"Processing question: question={question}, platform={platform}, category={selected_cat}, min_replies={min_replies}")
     
     clean_expired_cache(platform)
     
@@ -91,16 +91,20 @@ async def process_user_question(question, platform, cat_id_map, selected_cat):
     st.session_state.last_reset = result["last_reset"]
     st.session_state.rate_limit_until = result["rate_limit_until"]
     
-    min_replies = LIHKG_API["MIN_REPLIES"] if platform == "LIHKG" else HKGOLDEN_API["MIN_REPLIES"]
     filtered_items = [item for item in items if item["no_of_reply"] >= min_replies]
     
     if not filtered_items:
         logger.warning(f"No posts found with no_of_reply >= {min_replies}")
-        return {
-            "response": "無符合條件的帖子，請嘗試其他分類或稍後重試。",
-            "rate_limit_info": rate_limit_info,
-            "processed_data": []
-        }
+        # 備用邏輯：選擇回覆數最多的帖子
+        if items:
+            filtered_items = [max(items, key=lambda x: x["no_of_reply"])]
+            logger.info(f"Fallback: Selected post with {filtered_items[0]['no_of_reply']} replies (below min_replies={min_replies})")
+        else:
+            return {
+                "response": f"無符合條件的帖子（最少回覆數：{min_replies}）。請嘗試降低回覆數量要求或更改分類。",
+                "rate_limit_info": rate_limit_info,
+                "processed_data": []
+            }
     
     valid_items = [
         item for item in filtered_items
@@ -109,11 +113,15 @@ async def process_user_question(question, platform, cat_id_map, selected_cat):
     
     if not valid_items:
         logger.warning("No posts found with at least 3 non-empty replies")
-        return {
-            "response": "無帖子包含足夠的有效回覆，請稍後重試。",
-            "rate_limit_info": rate_limit_info,
-            "processed_data": []
-        }
+        # 備用邏輯：放寬有效回覆要求
+        valid_items = filtered_items
+        logger.info("Fallback: Using posts without strict reply validation")
+        if not valid_items:
+            return {
+                "response": f"無帖子包含足夠的有效回覆（最少回覆數：{min_replies}）。請嘗試降低回覆數量要求或稍後重試。",
+                "rate_limit_info": rate_limit_info,
+                "processed_data": []
+            }
     
     current_time = time.time()
     scored_items = [(item, score_item(item, current_time)) for item in valid_items]
@@ -147,11 +155,13 @@ async def process_user_question(question, platform, cat_id_map, selected_cat):
     
     if len(processed_data) < 3:
         logger.warning(f"Insufficient valid replies for thread_id={thread_id}, found={len(processed_data)}")
-        return {
-            "response": "帖子回覆不足或無有效內容，請稍後重試。",
-            "rate_limit_info": rate_limit_info,
-            "processed_data": []
-        }
+        # 放寬要求，允許少於 3 條回覆
+        if not processed_data:
+            return {
+                "response": f"帖子回覆不足或無有效內容（最少回覆數：{min_replies}）。請嘗試降低回覆數量要求或稍後重試。",
+                "rate_limit_info": rate_limit_info,
+                "processed_data": []
+            }
     
     cleaned_replies = [clean_reply_text(r["msg"])[:50] + '...' if len(clean_reply_text(r["msg"])) > 50 else clean_reply_text(r["msg"]) for r in replies[:2]]
     prompt = f"""

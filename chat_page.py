@@ -55,12 +55,23 @@ async def chat_page():
                 st.markdown("**提示預覽**：")
                 st.code(chat['response'], language="text")
             else:
-                # 分離分享文字和選擇理由
-                response_lines = chat['response'].split('\n')
-                share_text = response_lines[0].replace('分享文字：', '').strip() if response_lines else chat['response']
-                reason = response_lines[1].replace('選擇理由：', '').strip() if len(response_lines) > 1 else '無選擇理由'
+                # 改進回應解析邏輯
+                response = chat['response'].strip()
+                share_text = "無分享文字"
+                reason = "無選擇理由"
+                
+                # 使用正則表達式提取分享文字和選擇理由
+                share_match = re.search(r'分享文字：\s*(.*?)(?=\n選擇理由：|$)', response, re.DOTALL)
+                reason_match = re.search(r'選擇理由：\s*(.*)', response, re.DOTALL)
+                
+                if share_match:
+                    share_text = share_match.group(1).strip()
+                if reason_match:
+                    reason = reason_match.group(1).strip()
+                
                 st.markdown(f"**分享文字**：{share_text}")
                 st.markdown(f"**選擇理由**：{reason}")
+            
             if chat.get("debug_info") or chat.get("analysis"):
                 with st.expander("調試信息"):
                     if chat.get("analysis"):
@@ -246,10 +257,18 @@ async def chat_page():
                     return
             
             response = result.get("response", "無回應內容")
-            # 分離分享文字和選擇理由
-            response_lines = response.split('\n')
-            share_text = response_lines[0].replace('分享文字：', '').strip() if response_lines else response
-            reason = response_lines[1].replace('選擇理由：', '').strip() if len(response_lines) > 1 else '無選擇理由'
+            # 使用正則表達式提取分享文字和選擇理由
+            share_text = "無分享文字"
+            reason = "無選擇理由"
+            
+            share_match = re.search(r'分享文字：\s*(.*?)(?=\n選擇理由：|$)', response, re.DOTALL)
+            reason_match = re.search(r'選擇理由：\s*(.*)', response, re.DOTALL)
+            
+            if share_match:
+                share_text = share_match.group(1).strip()
+            if reason_match:
+                reason = reason_match.group(1).strip()
+            
             placeholder.markdown(f"**分享文字**：{share_text}")
             placeholder.markdown(f"**選擇理由**：{reason}")
             

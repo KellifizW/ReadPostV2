@@ -1,4 +1,3 @@
-import streamlit as st
 import streamlit.logger
 import aiohttp
 import asyncio
@@ -8,63 +7,56 @@ from config import GROK3_API
 
 logger = streamlit.logger.get_logger(__name__)
 
-async def stream_grok3_response(text: str, retries: int = GROK3_API["RETRIES"]) -> AsyncGenerator[str, None]:
-    """以流式方式從 Grok 3 API 獲取回應"""
-    try:
-        GROK3_API_KEY = st.secrets["grok3key"]
-    except KeyError:
-        logger.error("Grok 3 API 密鑰缺失")
-        st.error("未找到 Grok 3 API 密鑰，請檢查配置")
-        yield "錯誤: 缺少 API 密鑰"
+async def stream_grok3_response(prompt: str) -> AsyncGenerator[str, None]:
+    """Stream response from Grok 3 API"""
+    # 確認 GROK3_API 是否正確加載
+    logger.info(f"GROK3_API loaded: {GROK3_API}")
+    
+    if GROK3_API["API_KEY"] == "YOUR_GROK3_API_KEY":
+        logger.warning("GROK3_API_KEY is a placeholder. Please configure a valid API key in config.py.")
+        yield "Error: Invalid Grok 3 API key. Please configure a valid key in config.py."
         return
     
-    # 智能截斷
-    if len(text) > GROK3_API["TOKEN_LIMIT"]:
-        logger.warning(f"輸入超限: 字元數={len(text)}，將截斷")
-        text = text[:GROK3_API["TOKEN_LIMIT"] - 100] + "\n[已截斷]"
-    
     headers = {
+        "Authorization": f"Bearer {GROK3_API['API_KEY']}",
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {GROK3_API_KEY}"
+        "Accept": "application/json"
     }
+    
     payload = {
         "model": GROK3_API["MODEL"],
-        "messages": [
-            {"role": "system", "content": "你是 Grok 3，以繁體中文回答，確保回覆清晰、簡潔，僅基於提供數據。"},
-            {"role": "user", "content": text}
-        ],
+        "prompt": prompt,
         "max_tokens": GROK3_API["MAX_TOKENS"],
-        "temperature": GROK3_API["TEMPERATURE"],
         "stream": True
     }
     
-    for attempt in range(retries):
+    async with aiohttp.ClientSession() as session:
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(GROK3_API["URL"], headers=headers, json=payload, timeout=GROK3_API["TIMEOUT"]) as response:
-                    response.raise_for_status()
-                    async for line in response.content:
-                        if not line or line.isspace():
-                            continue
-                        line_str = line.decode('utf-8').strip()
-                        if line_str == "data: [DONE]":
-                            break
-                        if line_str.startswith("data: "):
-                            data = line_str[6:]
-                            try:
-                                chunk = json.loads(data)
-                                content = chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
-                                if content:
-                                    yield content
-                            except json.JSONDecodeError:
-                                logger.warning(f"JSON 解析失敗: 數據={line_str}")
-                                continue
-            logger.info(f"Grok 3 流式完成: 輸入字元={len(text)}")
-            return
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            logger.warning(f"Grok 3 請求失敗，第 {attempt+1} 次重試: 錯誤={str(e)}")
-            if attempt < retries - 1:
-                await asyncio.sleep(2 ** attempt)
-                continue
-            logger.error(f"Grok 3 異常: 錯誤={str(e)}")
-            yield f"錯誤: 連線失敗，請稍後重試或檢查網路"
+            async with session.post(
+                f"{GROK3_API['BASE_URL']}/completions",
+                headers=headers,
+                json=payload,
+                timeout=30
+            ) as response:
+                if response.status != 200:
+                    logger.error(f"Grok 3 API request failed: status={response.status}, reason={response.reason}")
+                    yield f"Error: API request failed with status {response.status}"
+                    return
+                
+                async for line in response.content:
+                    if line:
+                        try:
+                            decoded_line = line.decode('utf-8').strip()
+                            if decoded_line.startswith("data: "):
+                                json_data = json.loads(decoded_line[6:])
+                                if "choices" in json_data and json_data["choices"]:
+                                    content = json_data["choices"][0].get("text", "")
+                                    if content:
+                                        yield content
+                        except Exception as e:
+                            logger.error(f"Error parsing Grok 3 response: {str(e)}")
+                            yield f"Error: Failed to parse response - {str(e)}"
+                            return
+        except Exception as e:
+            logger.error(f"Grok 3 API connection error: {str(e)}")
+            yield f"Error: API connection failed - {str(e)}"

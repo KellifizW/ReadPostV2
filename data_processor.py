@@ -91,7 +91,12 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, mi
     st.session_state.last_reset = result["last_reset"]
     st.session_state.rate_limit_until = result["rate_limit_until"]
     
+    # 記錄每個帖子的 no_of_reply
+    for item in items:
+        logger.debug(f"Item: id={item.get('id')}, no_of_reply={item.get('no_of_reply')}, replies_count={len(item.get('replies', []))}")
+    
     filtered_items = [item for item in items if item["no_of_reply"] >= min_replies]
+    logger.info(f"Filtered items: total={len(items)}, filtered={len(filtered_items)} with no_of_reply >= {min_replies}")
     
     if not filtered_items:
         logger.warning(f"No posts found with no_of_reply >= {min_replies}")
@@ -106,14 +111,15 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, mi
                 "processed_data": []
             }
     
-    valid_items = [
-        item for item in filtered_items
-        if len([r for r in item["replies"] if r["msg"].strip()]) >= 3
-    ]
+    # 放寬回覆驗證條件，允許少於 3 條非空回覆
+    valid_items = filtered_items  # 直接使用 filtered_items，移除嚴格的回覆數檢查
+    for item in filtered_items:
+        non_empty_replies = len([r for r in item.get("replies", []) if r["msg"].strip()])
+        logger.debug(f"Item: id={item.get('id')}, no_of_reply={item.get('no_of_reply')}, non_empty_replies={non_empty_replies}")
     
     if not valid_items:
-        logger.warning("No posts found with at least 3 non-empty replies")
-        # 備用邏輯：放寬有效回覆要求
+        logger.warning("No valid posts after reply validation")
+        # 備用邏輯：使用 filtered_items 中回覆數最多的帖子
         valid_items = filtered_items
         logger.info("Fallback: Using posts without strict reply validation")
         if not valid_items:
@@ -153,15 +159,21 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, mi
         for reply in replies
     ]
     
-    if len(processed_data) < 3:
-        logger.warning(f"Insufficient valid replies for thread_id={thread_id}, found={len(processed_data)}")
-        # 放寬要求，允許少於 3 條回覆
-        if not processed_data:
-            return {
-                "response": f"帖子回覆不足或無有效內容（最少回覆數：{min_replies}）。請嘗試降低回覆數量要求或稍後重試。",
-                "rate_limit_info": rate_limit_info,
-                "processed_data": []
-            }
+    if not processed_data:
+        logger.warning(f"No valid replies for thread_id={thread_id}")
+        # 備用邏輯：生成無回覆的回應
+        response = f"""
+Hot thread on 高登討論區 with {selected_item["no_of_reply"]} replies! "{thread_title[:50]}" sparks debate. No valid replies found.
+
+Details:
+- ID: {thread_id}
+- Title: {thread_title}
+"""
+        return {
+            "response": response,
+            "rate_limit_info": rate_limit_info,
+            "processed_data": []
+        }
     
     cleaned_replies = [clean_reply_text(r["msg"])[:50] + '...' if len(clean_reply_text(r["msg"])) > 50 else clean_reply_text(r["msg"]) for r in replies[:2]]
     prompt = f"""
@@ -170,12 +182,12 @@ You are Grok, sharing a notable post from 高登討論區. Below is a selected p
 Post data:
 - ID: {thread_id}
 - Title: {thread_title}
-- Replies: {', '.join(cleaned_replies)}
+- Replies: {', '.join(cleaned_replies) if cleaned_replies else 'No valid replies'}
 
-Generate a concise sharing text (max 280 characters) highlighting why this post is engaging, including the title, reply count, and a snippet of the first reply.
+Generate a concise sharing text (max 280 characters) highlighting why this post is engaging, including the title, reply count, and a snippet of the first reply if available.
 
 Example:
-Hot 高登 post with {selected_item["no_of_reply"]} replies! "{thread_title[:50]}" sparks debate. First reply: "{cleaned_replies[0][:50]}". Chosen for lively discussion!
+Hot 高登 post with {selected_item["no_of_reply"]} replies! "{thread_title[:50]}" sparks debate. First reply: "{cleaned_replies[0][:50] if cleaned_replies else 'None'}". Chosen for lively discussion!
 
 {{ output }}
 """

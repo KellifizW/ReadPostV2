@@ -6,13 +6,16 @@ import random
 import pytz
 import aiohttp
 import hashlib
+import json
 from lihkg_api import get_lihkg_topic_list
 from hkgolden_api import get_hkgolden_topic_list
 import streamlit.logger
-from config import LIHKG_API, HKGOLDEN_API, GENERAL
+from config import LIHKG_API, HKGOLDEN_API, GENERAL, GROK3_API
+from threading import Lock
 
 logger = st.logger.get_logger(__name__)
 HONG_KONG_TZ = pytz.timezone(GENERAL["TIMEZONE"])
+api_test_lock = Lock()
 
 def get_api_search_key(query: str, page: int, user_id: str = "%GUEST%") -> str:
     """生成搜索API密鑰"""
@@ -77,6 +80,57 @@ async def search_thread_by_id(thread_id, platform):
             logger.error(f"Search thread error: platform={platform}, thread_id={thread_id}, error={str(e)}")
             return None
 
+async def test_grok3_api(prompt, high_reasoning=False):
+    """測試 Grok 3 API"""
+    try:
+        api_key = st.secrets["grok3key"]
+    except KeyError:
+        logger.error("Grok 3 API key is missing in Streamlit secrets (grok3key).")
+        return {"error": "Grok 3 API key is missing. Please configure 'grok3key' in Streamlit secrets."}
+    
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+    
+    payload = {
+        "model": "grok-3",
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": GROK3_API["MAX_TOKENS"],
+        "stream": False
+    }
+    
+    if high_reasoning:
+        payload["reasoning"] = {"effort": "high"}
+    
+    async with aiohttp.ClientSession() as session:
+        try:
+            logger.info(f"Sending Grok 3 API test request: url={GROK3_API['BASE_URL']}/chat/completions, prompt={prompt[:100]}..., high_reasoning={high_reasoning}")
+            async with session.post(
+                f"{GROK3_API['BASE_URL']}/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=180
+            ) as response:
+                response_text = await response.text()
+                if response.status != 200:
+                    logger.error(f"Grok 3 API test failed: status={response.status}, reason={response_text}")
+                    return {"error": f"API request failed with status {response.status}: {response_text}"}
+                data = json.loads(response_text)
+                content = data.get("choices", [{}])[0].get("message", {}).get("content", "No content")
+                logger.info(f"Grok 3 API test succeeded: content_length={len(content)}")
+                return {"content": content, "request": {"url": f"{GROK3_API['BASE_URL']}/chat/completions", "payload": payload}}
+        except aiohttp.ClientError as e:
+            logger.error(f"Grok 3 API test connection error: type={type(e).__name__}, message={str(e)}")
+            return {"error": f"API connection failed - {str(e)}"}
+        except asyncio.TimeoutError as e:
+            logger.error(f"Grok 3 API test timeout error: {str(e)}")
+            return {"error": f"API request timed out - {str(e)}"}
+        except Exception as e:
+            logger.error(f"Grok 3 API test unexpected error: type={type(e).__name__}, message={str(e)}")
+            return {"error": f"API unexpected error - {str(e)}"}
+
 async def test_page():
     st.title("討論區數據測試頁面")
     
@@ -88,6 +142,8 @@ async def test_page():
         st.session_state.last_reset = time.time()
     if "thread_content_cache" not in st.session_state:
         st.session_state.thread_content_cache = {}
+    if "last_api_test_time" not in st.session_state:
+        st.session_state.last_api_test_time = 0
     
     if time.time() < st.session_state.rate_limit_until:
         st.error(f"API rate limit active, retry after {datetime.fromtimestamp(st.session_state.rate_limit_until, tz=HONG_KONG_TZ).strftime('%Y-%m-%d %H:%M:%S')}")
@@ -229,3 +285,27 @@ async def test_page():
                 except ValueError:
                     st.error("Please enter a valid thread ID (numeric).")
                     logger.error(f"Invalid thread ID: {thread_id_input}")
+        
+        st.markdown("---")
+        st.markdown("### Test Grok 3 API")
+        test_prompt = st.text_area("Enter test prompt", value="Explain quantum computing in simple terms", height=100)
+        high_reasoning = st.checkbox("Enable high reasoning mode", value=False)
+        if st.button("Test Grok 3 API"):
+            with api_test_lock:
+                if time.time() - st.session_state.last_api_test_time < 10:
+                    st.warning("Please wait before submitting another API test.")
+                    logger.warning("Duplicate API test request blocked")
+                    return
+                st.session_state.last_api_test_time = time.time()
+            
+            with st.spinner("Testing Grok 3 API..."):
+                result = await test_grok3_api(test_prompt, high_reasoning)
+                st.markdown("#### API Test Results")
+                if "error" in result:
+                    st.error(f"API Test Failed: {result['error']}")
+                    logger.error(f"Grok 3 API test failed: error={result['error']}")
+                else:
+                    st.markdown(f"**Response:** {result['content']}")
+                    st.markdown("**Request Details:**")
+                    st.json(result['request'])
+                    logger.info(f"Grok 3 API test succeeded: prompt={test_prompt[:100]}..., response_length={len(result['content'])}")

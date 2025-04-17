@@ -1,297 +1,381 @@
-import streamlit as st
 import asyncio
-from datetime import datetime
-import pytz
-from data_processor import process_user_question
-import time
-from config import LIHKG_API, HKGOLDEN_API, GENERAL
+from lihkg_api import get_lihkg_topic_list, get_lihkg_thread_content
+from hkgolden_api import get_hkgolden_topic_list, get_hkgolden_thread_content
+from utils import clean_html
+import streamlit as st
 import streamlit.logger
+import time
+import random
+from datetime import datetime
+from config import LIHKG_API, HKGOLDEN_API
+from grok3_client import call_grok3_api
+import re
+from threading import Lock
 
 logger = streamlit.logger.get_logger(__name__)
-HONG_KONG_TZ = pytz.timezone(GENERAL["TIMEZONE"])
+processing_lock = Lock()
+active_requests = {}
 
-async def chat_page():
-    st.title("討論區聊天介面")
-    
-    # 初始化 session_state
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
-    if "rate_limit_until" not in st.session_state:
-        st.session_state.rate_limit_until = 0
-    if "request_counter" not in st.session_state:
-        st.session_state.request_counter = 0
-    if "last_reset" not in st.session_state:
-        st.session_state.last_reset = time.time()
-    if "thread_content_cache" not in st.session_state:
-        st.session_state.thread_content_cache = {}
-    if "last_submit_key" not in st.session_state:
-        st.session_state.last_submit_key = None
-    if "last_submit_time" not in st.session_state:
-        st.session_state.last_submit_time = 0
-    if "processing_request" not in st.session_state:
-        st.session_state.processing_request = False
+def clean_expired_cache(platform):
+    """清理過期緩存"""
+    cache_duration = LIHKG_API["CACHE_DURATION"] if platform == "LIHKG" else HKGOLDEN_API["CACHE_DURATION"]
+    current_time = time.time()
+    for cache_key in list(st.session_state.thread_content_cache.keys()):
+        if current_time - st.session_state.thread_content_cache[cache_key]["timestamp"] > cache_duration:
+            del st.session_state.thread_content_cache[cache_key]
 
-    # 檢查速率限制
-    if time.time() < st.session_state.rate_limit_until:
-        st.error(f"API 速率限制中，請在 {datetime.fromtimestamp(st.session_state.rate_limit_until, tz=HONG_KONG_TZ).strftime('%Y-%m-%d %H:%M:%S')} 後重試。")
-        return
+def clean_reply_text(text):
+    """清理回覆中的 HTML 標籤，保留純文字"""
+    text = re.sub(r'<img[^>]+alt="\[([^\]]+)\]"[^>]*>', r'[\1]', text)
+    text = clean_html(text)
+    text = ' '.join(text.split())
+    return text
+
+async def analyze_user_question(question, platform):
+    """使用Grok 3分析用戶問題，決定需要抓取的數據類型和數量"""
+    prompt = f"""
+你是一個智能助手，分析用戶問題以決定從討論區（{platform}）抓取哪些元數據。
+用戶問題："{question}"
+
+請回答以下問題：
+1. 問題的主要意圖是什麼？（例如：尋找特定話題、分析熱門帖子、查詢回覆數量等）
+2. 需要抓取哪些類型的數據？（例如：帖子標題、回覆數量、最後回覆時間、帖子點讚數、帖子負評數、回覆內容）
+3. 建議抓取的帖子數量（1-5個）？
+4. 每個帖子的回覆數量（1-100條）？
+5. 有無關鍵字或條件用於篩選帖子？（例如：包含特定詞語、按回覆數排序）
+
+回應格式：
+- 意圖: [描述]
+- 數據類型: [列表]
+- 帖子數量: [數字]
+- 回覆數量: [數字]
+- 篩選條件: [描述或"無"]
+"""
+    logger.info(f"Analyzing user question: question={question}, platform={platform}")
+    api_result = await call_grok3_api(prompt)
     
-    # 平台與分類選擇
-    platform = st.selectbox("選擇討論區平台", ["LIHKG", "高登討論區"], index=0)
+    if api_result.get("status") == "error":
+        logger.error(f"Failed to analyze question: {api_result['content']}")
+        return {
+            "intent": "unknown",
+            "data_types": ["title", "no_of_reply", "replies"],
+            "num_threads": 1,
+            "num_replies": 10,
+            "filter_condition": "none"
+        }
+    
+    content = api_result["content"].strip()
+    logger.info(f"Analysis result: {content[:200]}...")
+    
+    # 解析回應
+    intent = "unknown"
+    data_types = ["title", "no_of_reply", "replies"]
+    num_threads = 1
+    num_replies = 10
+    filter_condition = "none"
+    
+    for line in content.split("\n"):
+        line = line.strip()
+        if line.startswith("意圖:"):
+            intent = line.replace("意圖:", "").strip()
+        elif line.startswith("數據類型:"):
+            data_types = [t.strip() for t in line.replace("數據類型:", "").strip().split(",")]
+        elif line.startswith("帖子數量:"):
+            try:
+                num_threads = min(max(int(line.replace("帖子數量:", "").strip()), 1), 5)
+            except ValueError:
+                pass
+        elif line.startswith("回覆數量:"):
+            try:
+                num_replies = min(max(int(line.replace("回覆數量:", "").strip()), 1), 100)
+            except ValueError:
+                pass
+        elif line.startswith("篩選條件:"):
+            filter_condition = line.replace("篩選條件:", "").strip()
+    
+    # 如果意圖涉及「最多回覆」，設置 num_replies 為最大值
+    if "最多回覆" in intent or "回覆數量最多" in intent:
+        num_replies = 100
+        filter_condition = "按回覆數量由高到低排序"
+        data_types.extend(["last_reply_time", "like_count", "dislike_count"])
+    
+    return {
+        "intent": intent,
+        "data_types": data_types,
+        "num_threads": num_threads,
+        "num_replies": num_replies,
+        "filter_condition": filter_condition
+    }
+
+async def process_user_question(question, platform, cat_id_map, selected_cat, return_prompt=False):
+    """處理用戶問題並返回相關帖子數據或原始 prompt"""
+    request_key = f"{question}:{platform}:{selected_cat}:{'preview' if return_prompt else 'normal'}"
+    current_time = time.time()
+    
+    with processing_lock:
+        if request_key in active_requests and current_time - active_requests[request_key]["timestamp"] < 30:
+            logger.warning(f"Skipping duplicate request: request_key={request_key}")
+            return active_requests[request_key]["result"]
+        
+        active_requests[request_key] = {"timestamp": current_time, "result": None}
+    
+    logger.info(f"Starting to process question: request_key={request_key}")
+    
+    clean_expired_cache(platform)
+    
+    # 分析用戶問題
+    analysis = await analyze_user_question(question, platform)
+    logger.info(f"Question analysis: intent={analysis['intent']}, num_threads={analysis['num_threads']}, num_replies={analysis['num_replies']}")
+    
+    cat_id = cat_id_map[selected_cat]
+    max_pages = 5 if "最多回覆" in analysis["intent"] else max(1, analysis["num_threads"])
+    max_replies = min(analysis["num_replies"], 100)
+    logger.info(f"Fetching thread with max_replies={max_replies}")
+    
+    # 抓取帖子列表
+    start_fetch_time = time.time()
     if platform == "LIHKG":
-        categories = LIHKG_API["CATEGORIES"]
+        result = await get_lihkg_topic_list(
+            cat_id=cat_id,
+            sub_cat_id=0,
+            start_page=1,
+            max_pages=max_pages,
+            request_counter=st.session_state.get("request_counter", 0),
+            last_reset=st.session_state.get("last_reset", time.time()),
+            rate_limit_until=st.session_state.get("rate_limit_until", 0)
+        )
     else:
-        categories = HKGOLDEN_API["CATEGORIES"]
+        result = await get_hkgolden_topic_list(
+            cat_id=cat_id,
+            sub_cat_id=0,
+            start_page=1,
+            max_pages=max_pages,
+            request_counter=st.session_state.get("request_counter", 0),
+            last_reset=st.session_state.get("last_reset", time.time()),
+            rate_limit_until=st.session_state.get("rate_limit_until", 0)
+        )
     
-    selected_cat = st.selectbox("選擇分類", options=list(categories.keys()), index=0)
+    items = result["items"]
+    rate_limit_info = result["rate_limit_info"]
+    st.session_state.request_counter = result["request_counter"]
+    st.session_state.last_reset = result["last_reset"]
+    st.session_state.rate_limit_until = result["rate_limit_until"]
     
-    # 顯示聊天記錄
-    st.markdown("### 聊天記錄")
-    for chat in st.session_state.chat_history:
-        with st.chat_message("user"):
-            st.markdown(f"**用戶**：{chat['question']}")
-        with st.chat_message("assistant"):
-            if chat.get("is_preview"):
-                st.markdown("**提示預覽**：")
-                st.code(chat['response'], language="text")
-            else:
-                # 改進回應解析邏輯
-                response = chat['response'].strip()
-                share_text = "無分享文字"
-                reason = "無選擇理由"
-                
-                # 使用正則表達式提取分享文字和選擇理由
-                share_match = re.search(r'分享文字：\s*(.*?)(?=\n選擇理由：|$)', response, re.DOTALL)
-                reason_match = re.search(r'選擇理由：\s*(.*)', response, re.DOTALL)
-                
-                if share_match:
-                    share_text = share_match.group(1).strip()
-                if reason_match:
-                    reason = reason_match.group(1).strip()
-                
-                st.markdown(f"**分享文字**：{share_text}")
-                st.markdown(f"**選擇理由**：{reason}")
-            
-            if chat.get("debug_info") or chat.get("analysis"):
-                with st.expander("調試信息"):
-                    if chat.get("analysis"):
-                        analysis = chat["analysis"]
-                        st.markdown("#### 問題分析：")
-                        st.markdown(f"- 意圖：{analysis['intent']}")
-                        st.markdown(f"- 數據類型：{', '.join(analysis['data_types'])}")
-                        st.markdown(f"- 帖子數量：{analysis['num_threads']}")
-                        st.markdown(f"- 回覆數量：{analysis['num_replies']}")
-                        st.markdown(f"- 篩選條件：{analysis['filter_condition']}")
-                    if chat.get("debug_info"):
-                        for info in chat["debug_info"]:
-                            st.markdown(info)
+    logger.info(f"Fetch completed: platform={platform}, category={selected_cat}, total_items={len(items)}, elapsed={time.time() - start_fetch_time:.2f}s")
     
-    # 用戶輸入與按鈕
-    user_input = st.chat_input("輸入你的問題或要求（例如：分享任何帖文）", key="chat_page_chat_input")
-    preview_button = st.button("預覽", key="preview_button")
-
-    # 防止並發處理
-    if st.session_state.processing_request:
-        st.warning("正在處理請求，請稍候。")
-        return
-
-    # 處理預覽按鈕
-    if preview_button and user_input:
-        logger.info(f"Preview button clicked: question={user_input}, platform={platform}, category={selected_cat}")
-        
-        # 檢查重複提交
-        submit_key = f"preview:{user_input}:{platform}:{selected_cat}"
-        current_time = time.time()
-        if (st.session_state.last_submit_key == submit_key and 
-            current_time - st.session_state.last_submit_time < 5):
-            logger.warning("Skipping duplicate preview submission")
-            st.warning("請勿重複提交相同預覽請求，請稍後再試。")
-            return
-        
-        st.session_state.processing_request = True
-        st.session_state.last_submit_key = submit_key
-        st.session_state.last_submit_time = current_time
-
-        # 顯示用戶輸入
-        with st.chat_message("user"):
-            st.markdown(f"**用戶**：{user_input}")
-        
-        # 生成提示
-        with st.chat_message("assistant"):
-            placeholder = st.empty()
-            debug_info = []
-            
-            cache_key = f"{platform}_{selected_cat}_{user_input}"
-            use_cache = cache_key in st.session_state.thread_content_cache and \
-                        time.time() - st.session_state.thread_content_cache[cache_key]["timestamp"] < \
-                        (LIHKG_API["CACHE_DURATION"] if platform == "LIHKG" else HKGOLDEN_API["CACHE_DURATION"])
-            
-            if use_cache:
-                logger.info(f"Using cache for preview: platform={platform}, category={selected_cat}, question={user_input}")
-                result = st.session_state.thread_content_cache[cache_key]["data"]
-            else:
-                try:
-                    logger.info(f"Calling process_user_question for preview: question={user_input}, platform={platform}, category={selected_cat}")
-                    result = await process_user_question(
-                        user_input,
-                        platform=platform,
-                        cat_id_map=categories,
-                        selected_cat=selected_cat,
-                        return_prompt=True
-                    )
-                    st.session_state.thread_content_cache[cache_key] = {
-                        "data": result,
-                        "timestamp": time.time()
-                    }
-                except Exception as e:
-                    result = {}
-                    debug_info = [f"#### 調試信息：\n- 處理錯誤: 原因={str(e)}"]
-                    if result.get("rate_limit_info"):
-                        debug_info.append("- 速率限制或錯誤記錄：")
-                        debug_info.extend(f"  - {info}" for info in result["rate_limit_info"])
-                    error_message = f"生成提示失敗，原因：{str(e)}。請稍後重試或檢查 API 配置。"
-                    placeholder.markdown(error_message)
-                    st.session_state.chat_history.append({
-                        "question": user_input,
-                        "response": error_message,
-                        "debug_info": debug_info,
-                        "is_preview": True,
-                        "timestamp": current_time
-                    })
-                    logger.error(f"Preview failed: question={user_input}, platform={platform}, error={str(e)}")
-                    st.session_state.processing_request = False
-                    return
-            
-            prompt = result.get("response", "無提示內容")
-            placeholder.markdown("**提示預覽**：")
-            placeholder.code(prompt, language="text")
-            
-            if result.get("rate_limit_info"):
-                debug_info.append("#### 調試信息：")
-                debug_info.append("- 速率限制或錯誤記錄：")
-                debug_info.extend(f"  - {info}" for info in result["rate_limit_info"])
-            
-            # 避免重複追加聊天記錄
-            if not any(
-                chat["question"] == user_input and 
-                chat["response"] == prompt and 
-                chat.get("is_preview") and 
-                abs(chat["timestamp"] - current_time) < 1
-                for chat in st.session_state.chat_history
-            ):
-                st.session_state.chat_history.append({
-                    "question": user_input,
-                    "response": prompt,
-                    "debug_info": debug_info if debug_info else None,
-                    "analysis": result.get("analysis"),
-                    "is_preview": True,
-                    "timestamp": current_time
-                })
-            
-            logger.info(f"Completed preview: question={user_input}, platform={platform}, prompt_length={len(prompt)}, chat_history_length={len(st.session_state.chat_history)}")
-            st.session_state.processing_request = False
+    if not items:
+        logger.error("No items fetched from API")
+        result = {
+            "response": f"無法抓取帖子，API 返回空數據。請檢查分類（{selected_cat}）或稍後重試。",
+            "rate_limit_info": rate_limit_info,
+            "processed_data": [],
+            "analysis": analysis
+        }
+        with processing_lock:
+            active_requests[request_key]["result"] = result
+            return result
     
-    # 處理正常提交
-    if user_input and not preview_button and not st.session_state.processing_request:
-        logger.info(f"Processing user input: question={user_input}, platform={platform}, category={selected_cat}")
+    # 根據篩選條件選擇帖子
+    selected_items = []
+    filter_condition = analysis["filter_condition"].lower()
+    if filter_condition != "none":
+        if "回覆數量由高到低" in filter_condition:
+            selected_items = sorted(
+                [item for item in items if item.get("no_of_reply", 0) > 0],
+                key=lambda x: x.get("no_of_reply", 0),
+                reverse=True
+            )[:analysis["num_threads"]]
+        else:
+            keywords = filter_condition.split()
+            selected_items = [
+                item for item in items
+                if any(keyword.lower() in item["title"].lower() for keyword in keywords) and item.get("no_of_reply", 0) > 0
+            ]
+    if not selected_items:
+        selected_items = sorted(
+            [item for item in items if item.get("no_of_reply", 0) > 0],
+            key=lambda x: x.get("no_of_reply", 0),
+            reverse=True
+        )[:analysis["num_threads"]]
+    
+    if not selected_items:
+        selected_items = items[:analysis["num_threads"]]
+    
+    processed_data = []
+    threads_data = []
+    
+    # 抓取每個帖子的回覆
+    for selected_item in selected_items:
+        try:
+            thread_id = selected_item["thread_id"] if platform == "LIHKG" else selected_item["id"]
+        except KeyError as e:
+            logger.error(f"Missing thread_id or id in selected_item: {selected_item}, error={str(e)}")
+            continue
         
-        # 檢查重複提交
-        submit_key = f"{user_input}:{platform}:{selected_cat}"
-        current_time = time.time()
-        if (st.session_state.last_submit_key == submit_key and 
-            current_time - st.session_state.last_submit_time < 5):
-            logger.warning("Skipping duplicate chat submission")
-            st.warning("請勿重複提交相同請求，請稍後再試。")
-            return
+        thread_title = selected_item["title"]
+        no_of_reply = selected_item.get("no_of_reply", 0)
+        logger.info(f"Selected thread: thread_id={thread_id}, title={thread_title}, no_of_reply={no_of_reply}")
         
-        st.session_state.processing_request = True
-        st.session_state.last_submit_key = submit_key
-        st.session_state.last_submit_time = current_time
+        # 動態設置 max_replies 為帖子總回覆數（最多 100）
+        thread_max_replies = min(no_of_reply, max_replies) if no_of_reply > 0 else max_replies
+        logger.info(f"Fetching thread content: thread_id={thread_id}, platform={platform}, max_replies={thread_max_replies}")
+        
+        if platform == "LIHKG":
+            thread_result = await get_lihkg_thread_content(
+                thread_id=thread_id,
+                cat_id=cat_id,
+                request_counter=st.session_state.request_counter,
+                last_reset=st.session_state.last_reset,
+                rate_limit_until=st.session_state.rate_limit_until,
+                max_replies=thread_max_replies
+            )
+        else:
+            thread_result = await get_hkgolden_thread_content(
+                thread_id=thread_id,
+                cat_id=cat_id,
+                request_counter=st.session_state.request_counter,
+                last_reset=st.session_state.last_reset,
+                rate_limit_until=st.session_state.rate_limit_until,
+                max_replies=thread_max_replies
+            )
+        
+        replies = thread_result["replies"]
+        thread_title = thread_result["title"] or thread_title
+        total_replies = thread_result.get("total_replies", no_of_reply)
+        rate_limit_info.extend(thread_result["rate_limit_info"])
+        st.session_state.request_counter = thread_result["request_counter"]
+        st.session_state.rate_limit_until = thread_result["rate_limit_until"]
+        
+        logger.info(f"Thread content fetched: thread_id={thread_id}, title={thread_title}, replies={len(replies)}")
+        
+        thread_data = {
+            "thread_id": thread_id,
+            "title": thread_title,
+            "no_of_reply": no_of_reply,
+            "last_reply_time": selected_item.get("last_reply_time", 0),
+            "like_count": selected_item.get("like_count", 0),
+            "dislike_count": selected_item.get("dislike_count", 0),
+            "total_replies": total_replies,
+            "replies": [
+                {
+                    "content": clean_reply_text(reply["msg"])
+                }
+                for reply in replies
+            ]
+        }
+        threads_data.append(thread_data)
+        
+        processed_data.extend([
+            {
+                "thread_id": thread_id,
+                "title": thread_title,
+                "content": clean_reply_text(reply["msg"])
+            }
+            for reply in replies
+        ])
+    
+    # 生成提示
+    prompt = f"""
+你是一個智能助手，從 {platform}（{selected_cat} 分類）分享有趣的帖子。以下是用戶問題和分析結果，以及選定的帖子數據。
 
-        # 顯示用戶輸入
-        with st.chat_message("user"):
-            st.markdown(f"**用戶**：{user_input}")
+用戶問題："{question}"
+分析結果：
+- 意圖：{analysis['intent']}
+- 數據類型：{', '.join(analysis['data_types'])}
+- 篩選條件：{analysis['filter_condition']}
+
+帖子數據：
+"""
+    for thread in threads_data:
+        prompt += f"""
+- 帖子 ID：{thread['thread_id']}
+- 標題：{thread['title']}
+- 回覆數量：{thread['no_of_reply']}
+- 總回覆數量：{thread['total_replies']}
+- 最後回覆時間：{datetime.fromtimestamp(thread['last_reply_time']).strftime('%Y-%m-%d %H:%M:%S') if thread['last_reply_time'] else '未知'}
+- 點讚數：{thread['like_count']}
+- 負評數：{thread['dislike_count']}
+- 回覆（前 {len(thread['replies'])} 條）：
+"""
+        for reply in thread["replies"]:
+            content = reply["content"][:100] + '...' if len(reply["content"]) > 100 else reply["content"]
+            prompt += f"  - {content}\n"
+    
+    prompt += f"""
+請完成以下任務：
+1. 生成一段簡潔的分享文字，嚴格限制在 500 字以內，突出帖子的吸引之處，包含標題、回覆數量和首條回覆的片段（若有）。可根據需要使用帖子 ID、最後回覆時間、點讚數或負評數來增強分享內容。
+2. 提供一段簡短的選擇理由（150 字以內），解釋為何選擇此帖子（例如話題性、幽默性、爭議性、回覆數量多等）。
+
+回應格式：
+{{ output }}
+分享文字：[分享文字]
+選擇理由：[選擇理由]
+{{ output }}
+"""
+    
+    logger.info(f"Generated prompt (length={len(prompt)} chars)")
+    
+    if return_prompt:
+        result = {
+            "response": prompt,
+            "rate_limit_info": rate_limit_info,
+            "processed_data": processed_data,
+            "analysis": analysis
+        }
+        with processing_lock:
+            active_requests[request_key]["result"] = result
+        return result
+    
+    # 調用Grok 3生成回應
+    start_api_time = time.time()
+    api_result = await call_grok3_api(prompt)
+    api_elapsed = time.time() - start_api_time
+    logger.info(f"Grok 3 API call completed: elapsed={api_elapsed:.2f}s")
+    
+    if api_result.get("status") == "error":
+        logger.warning(f"Falling back to local response due to Grok 3 API failure: {api_result['content']}")
+        response = f"""
+熱門帖子來自 {platform}！問題意圖：{analysis['intent']}。
+"""
+        for thread in threads_data[:1]:
+            first_reply = thread["replies"][0]["content"][:50] if thread["replies"] else "無回覆"
+            response += f"""
+- "{thread['title'][:50]}"（{thread['no_of_reply']} 條回覆）引發討論。首條回覆："{first_reply}"。
+"""
+        response = response[:500]
+    else:
+        # 改進回應提取邏輯
+        content = api_result["content"].strip()
+        # 清理 { output } 標記
+        content = re.sub(r'\{\{ output \}\}', '', content).strip()
+        share_text = "無分享文字"
+        reason = "無選擇理由"
         
-        # 處理請求
-        with st.chat_message("assistant"):
-            placeholder = st.empty()
-            debug_info = []
-            
-            cache_key = f"{platform}_{selected_cat}_{user_input}"
-            use_cache = cache_key in st.session_state.thread_content_cache and \
-                        time.time() - st.session_state.thread_content_cache[cache_key]["timestamp"] < \
-                        (LIHKG_API["CACHE_DURATION"] if platform == "LIHKG" else HKGOLDEN_API["CACHE_DURATION"])
-            
-            if use_cache:
-                logger.info(f"Using cache: platform={platform}, category={selected_cat}, question={user_input}")
-                result = st.session_state.thread_content_cache[cache_key]["data"]
-            else:
-                try:
-                    logger.info(f"Calling process_user_question: question={user_input}, platform={platform}, category={selected_cat}")
-                    result = await process_user_question(
-                        user_input,
-                        platform=platform,
-                        cat_id_map=categories,
-                        selected_cat=selected_cat
-                    )
-                    st.session_state.thread_content_cache[cache_key] = {
-                        "data": result,
-                        "timestamp": time.time()
-                    }
-                except Exception as e:
-                    result = {}
-                    debug_info = [f"#### 調試信息：\n- 處理錯誤: 原因={str(e)}"]
-                    if result.get("rate_limit_info"):
-                        debug_info.append("- 速率限制或錯誤記錄：")
-                        debug_info.extend(f"  - {info}" for info in result["rate_limit_info"])
-                    error_message = f"處理失敗，原因：{str(e)}。請稍後重試或檢查 API 配置。"
-                    placeholder.markdown(error_message)
-                    st.session_state.chat_history.append({
-                        "question": user_input,
-                        "response": error_message,
-                        "debug_info": debug_info,
-                        "timestamp": current_time
-                    })
-                    logger.error(f"Processing failed: question={user_input}, platform={platform}, error={str(e)}")
-                    st.session_state.processing_request = False
-                    return
-            
-            response = result.get("response", "無回應內容")
-            # 使用正則表達式提取分享文字和選擇理由
-            share_text = "無分享文字"
-            reason = "無選擇理由"
-            
-            share_match = re.search(r'分享文字：\s*(.*?)(?=\n選擇理由：|$)', response, re.DOTALL)
-            reason_match = re.search(r'選擇理由：\s*(.*)', response, re.DOTALL)
-            
-            if share_match:
-                share_text = share_match.group(1).strip()
-            if reason_match:
-                reason = reason_match.group(1).strip()
-            
-            placeholder.markdown(f"**分享文字**：{share_text}")
-            placeholder.markdown(f"**選擇理由**：{reason}")
-            
-            if result.get("rate_limit_info"):
-                debug_info.append("#### 調試信息：")
-                debug_info.append("- 速率限制或錯誤記錄：")
-                debug_info.extend(f"  - {info}" for info in result["rate_limit_info"])
-            
-            # 避免重複追加聊天記錄
-            if not any(
-                chat["question"] == user_input and 
-                chat["response"] == response and 
-                not chat.get("is_preview") and 
-                abs(chat["timestamp"] - current_time) < 1
-                for chat in st.session_state.chat_history
-            ):
-                st.session_state.chat_history.append({
-                    "question": user_input,
-                    "response": response,
-                    "debug_info": debug_info if debug_info else None,
-                    "analysis": result.get("analysis"),
-                    "timestamp": current_time
-                })
-            
-            logger.info(f"Completed processing: question={user_input}, platform={platform}, response_length={len(response)}, chat_history_length={len(st.session_state.chat_history)}")
-            st.session_state.processing_request = False
+        # 使用正則表達式提取分享文字和選擇理由
+        share_match = re.search(r'分享文字：\s*(.*?)(?=\n選擇理由：|$)', content, re.DOTALL)
+        reason_match = re.search(r'選擇理由：\s*(.*)', content, re.DOTALL)
+        
+        if share_match:
+            share_text = share_match.group(1).strip()[:500]
+        if reason_match:
+            reason = reason_match.group(1).strip()[:150]
+        
+        response = f"分享文字：{share_text}\n選擇理由：{reason}"
+        logger.info(f"Extracted response: share_text={share_text[:100]}..., reason={reason[:100]}...")
+    
+    result = {
+        "response": response,
+        "rate_limit_info": rate_limit_info,
+        "processed_data": processed_data,
+        "analysis": analysis
+    }
+    
+    with processing_lock:
+        active_requests[request_key]["result"] = result
+        if current_time - active_requests[request_key]["timestamp"] > 30:
+            del active_requests[request_key]
+    
+    logger.info(f"Processed question: question={question}, platform={platform}, response_length={len(response)}")
+    logger.info(f"Selected {len(selected_items)} threads, total replies fetched: {sum(len(thread['replies']) for thread in threads_data)}")
+    
+    return result

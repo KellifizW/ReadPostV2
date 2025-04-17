@@ -95,10 +95,9 @@ async def analyze_user_question(question, platform):
         elif line.startswith("篩選條件:"):
             filter_condition = line.replace("篩選條件:", "").strip()
     
-    # 改進意圖解析
     if "分享" in question.lower():
         if "幾個" in question.lower():
-            num_threads = max(num_threads, 3)  # 默認「幾個」為 3
+            num_threads = max(num_threads, 3)
             intent = "分享最新帖子"
         elif "個" in question:
             match = re.search(r'(\d+)個', question)
@@ -186,7 +185,6 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
             active_requests[request_key]["result"] = result
             return result
     
-    # 選擇帖子
     selected_items = []
     filter_condition = analysis["filter_condition"].lower()
     
@@ -195,7 +193,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
         for item in items:
             last_reply_time = item.get("last_reply_time", 0)
             no_of_reply = item.get("no_of_reply", 0)
-            if last_reply_time and no_of_reply >= 10:  # 放寬過濾，要求至少10條回覆
+            if last_reply_time and no_of_reply >= 10:
                 filtered_items.append(item)
             else:
                 logger.info(f"Filtered out thread: id={item.get('id')}, last_reply_time={last_reply_time}, no_of_reply={no_of_reply}")
@@ -405,7 +403,6 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
             active_requests[request_key]["result"] = result
         return result
     
-    # 調用 Grok 3 生成回應（支持流式）
     start_api_time = time.time()
     api_result = await call_grok3_api(prompt, stream=True)
     api_elapsed = time.time() - start_api_time
@@ -424,9 +421,8 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
         response = response[:share_text_limit]
         response += f"\n選擇理由：選擇這些帖子因其最新性和回覆數量多。"
     else:
-        # 累積流式回應
         content = ""
-        for chunk in api_result["content"]:
+        async for chunk in api_result["content"]:
             if chunk:
                 content += chunk
                 logger.debug(f"Received chunk: {chunk[:50]}...")

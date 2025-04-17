@@ -24,14 +24,15 @@ async def search_thread_by_id(thread_id, platform):
     """使用搜尋 API 查詢帖子詳細信息"""
     headers = {
         "User-Agent": random.choice([
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
             "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Mobile/15E148 Safari/604.1",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
         ]),
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "zh-HK,zh-Hant;q=0.9,en;q=0.8",
         "Connection": "keep-alive",
         "Referer": f"{LIHKG_API['BASE_URL'] if platform == 'LIHKG' else HKGOLDEN_API['BASE_URL']}/",
+        "hkgauth": "null"
     }
     
     if platform == "LIHKG":
@@ -39,16 +40,14 @@ async def search_thread_by_id(thread_id, platform):
         params = {}
     else:
         api_key = get_api_search_key(str(thread_id), 1)
-        url = f"{HKGOLDEN_API['BASE_URL']}/v1/topics/search"
+        url = f"{HKGOLDEN_API['BASE_URL']}/v1/view/{thread_id}/1"
         params = {
             "s": api_key,
-            "q": str(thread_id),
+            "message": str(thread_id),
             "page": "1",
-            "count": "30",
             "user_id": "0",
-            "block": "Y",
-            "sensormode": "N",
-            "filterMode": "N",
+            "sensormode": "Y",
+            "hideblock": "N",
             "returntype": "json"
         }
     
@@ -56,19 +55,26 @@ async def search_thread_by_id(thread_id, platform):
         try:
             async with session.get(url, headers=headers, params=params if platform == "HKGOLDEN" else None) as response:
                 if response.status != 200:
-                    logger.error(f"搜尋帖子失敗: platform={platform}, thread_id={thread_id}, 狀態碼={response.status}")
+                    logger.error(f"Search thread failed: platform={platform}, thread_id={thread_id}, status={response.status}")
                     return None
                 data = await response.json()
-                if not data.get("success", True):
-                    logger.error(f"搜尋帖子 API 返回失敗: platform={platform}, thread_id={thread_id}, 錯誤={data.get('error_message', '未知錯誤')}")
+                if not data.get("result", True):
+                    logger.error(f"Search thread API returned failure: platform={platform}, thread_id={thread_id}, error={data.get('error_message', 'Unknown error')}")
                     return None
-                items = data["response"].get("items", []) if platform == "LIHKG" else data.get("data", [])
-                if not items:
-                    logger.warning(f"搜尋帖子無結果: platform={platform}, thread_id={thread_id}")
+                thread_data = data.get("data", {}) if platform == "HKGOLDEN" else data["response"].get("items", [{}])[0]
+                if not thread_data:
+                    logger.warning(f"Search thread no results: platform={platform}, thread_id={thread_id}")
                     return None
-                return items[0]
+                return {
+                    "thread_id": thread_id,
+                    "title": thread_data.get("title", "Unknown title"),
+                    "no_of_reply": thread_data.get("totalReplies", 0),
+                    "last_reply_time": thread_data.get("lastReplyDate", 0) / 1000,
+                    "like_count": thread_data.get("marksGood", 0),
+                    "dislike_count": thread_data.get("marksBad", 0)
+                }
         except Exception as e:
-            logger.error(f"搜尋帖子錯誤: platform={platform}, thread_id={thread_id}, 錯誤={str(e)}")
+            logger.error(f"Search thread error: platform={platform}, thread_id={thread_id}, error={str(e)}")
             return None
 
 async def test_page():
@@ -84,10 +90,10 @@ async def test_page():
         st.session_state.thread_content_cache = {}
     
     if time.time() < st.session_state.rate_limit_until:
-        st.error(f"API 速率限制中，請在 {datetime.fromtimestamp(st.session_state.rate_limit_until, tz=HONG_KONG_TZ).strftime('%Y-%m-%d %H:%M:%S')} 後重試。")
+        st.error(f"API rate limit active, retry after {datetime.fromtimestamp(st.session_state.rate_limit_until, tz=HONG_KONG_TZ).strftime('%Y-%m-%d %H:%M:%S')}")
         return
     
-    platform = st.selectbox("選擇討論區平台", ["LIHKG", "高登討論區"], index=0)
+    platform = st.selectbox("Choose discussion platform", ["LIHKG", "高登討論區"], index=0)
     if platform == "LIHKG":
         cat_id_map = LIHKG_API["CATEGORIES"]
         min_replies = LIHKG_API["MIN_REPLIES"]
@@ -98,25 +104,25 @@ async def test_page():
     col1, col2 = st.columns([3, 1])
     with col2:
         selected_cat = st.selectbox(
-            "選擇分類",
+            "Choose category",
             options=list(cat_id_map.keys()),
             index=0
         )
         cat_id = cat_id_map[selected_cat]
-        max_pages = st.slider("抓取頁數", 1, 5, LIHKG_API["MAX_PAGES"] if platform == "LIHKG" else HKGOLDEN_API["MAX_PAGES"])
+        max_pages = st.slider("Pages to fetch", 1, 5, LIHKG_API["MAX_PAGES"] if platform == "LIHKG" else HKGOLDEN_API["MAX_PAGES"])
     
     with col1:
-        st.markdown("#### 速率限制狀態")
-        st.markdown(f"- 當前請求計數: {st.session_state.request_counter}")
-        st.markdown(f"- 最後重置時間: {datetime.fromtimestamp(st.session_state.last_reset, tz=HONG_KONG_TZ).strftime('%Y-%m-%d %H:%M:%S')}")
+        st.markdown("#### Rate Limit Status")
+        st.markdown(f"- Current request count: {st.session_state.request_counter}")
+        st.markdown(f"- Last reset time: {datetime.fromtimestamp(st.session_state.last_reset, tz=HONG_KONG_TZ).strftime('%Y-%m-%d %H:%M:%S')}")
         st.markdown(
-            f"- 速率限制解除時間: "
-            f"{datetime.fromtimestamp(st.session_state.rate_limit_until, tz=HONG_KONG_TZ).strftime('%Y-%m-%d %H:%M:%S') if st.session_state.rate_limit_until > time.time() else '無限制'}"
+            f"- Rate limit expiry: "
+            f"{datetime.fromtimestamp(st.session_state.rate_limit_until, tz=HONG_KONG_TZ).strftime('%Y-%m-%d %H:%M:%S') if st.session_state.rate_limit_until > time.time() else 'None'}"
         )
         
-        if st.button("抓取數據"):
-            with st.spinner("正在抓取數據..."):
-                logger.info(f"開始抓取數據: platform={platform}, 分類={selected_cat}, cat_id={cat_id}, 頁數={max_pages}")
+        if st.button("Fetch Data"):
+            with st.spinner("Fetching data..."):
+                logger.info(f"Starting data fetch: platform={platform}, category={selected_cat}, cat_id={cat_id}, pages={max_pages}")
                 
                 if platform == "LIHKG":
                     result = await get_lihkg_topic_list(
@@ -146,17 +152,17 @@ async def test_page():
                 st.session_state.rate_limit_until = result["rate_limit_until"]
                 
                 logger.info(
-                    f"抓取完成: platform={platform}, 分類={selected_cat}, cat_id={cat_id}, 頁數={max_pages}, "
-                    f"帖子數={len(items)}, 成功={len(items) > 0}, "
-                    f"速率限制信息={rate_limit_info if rate_limit_info else '無'}"
+                    f"Fetch completed: platform={platform}, category={selected_cat}, cat_id={cat_id}, pages={max_pages}, "
+                    f"items={len(items)}, success={len(items) > 0}, "
+                    f"rate_limit_info={rate_limit_info if rate_limit_info else 'None'}"
                 )
                 
                 expected_items = max_pages * 60
                 if len(items) < expected_items * 0.5:
-                    st.warning("抓取數據不完整，可能是因為 API 速率限制。請稍後重試，或減少抓取頁數。")
+                    st.warning("Incomplete data fetched, possibly due to API rate limits. Try again later or reduce pages.")
                 
                 if rate_limit_info:
-                    st.markdown("#### 速率限制調試信息")
+                    st.markdown("#### Rate Limit Debug Info")
                     for info in rate_limit_info:
                         st.markdown(f"- {info}")
                 
@@ -169,7 +175,7 @@ async def test_page():
                             datetime.fromtimestamp(int(item.get("last_reply_time", 0)), tz=HONG_KONG_TZ)
                             .strftime("%Y-%m-%d %H:%M:%S")
                             if item.get("last_reply_time")
-                            else "未知"
+                            else "Unknown"
                         ),
                         "like_count": item.get("like_count", 0),
                         "dislike_count": item.get("dislike_count", 0),
@@ -179,47 +185,47 @@ async def test_page():
                 
                 filtered_items = [item for item in metadata_list if item["no_of_reply"] >= min_replies]
                 
-                st.markdown(f"### 抓取結果（平台：{platform}，分類：{selected_cat}）")
-                st.markdown(f"- 總共抓取 {len(metadata_list)} 篇帖子")
-                st.markdown(f"- 回覆數 ≥ {min_replies} 的帖子數：{len(filtered_items)} 篇")
+                st.markdown(f"### Fetch Results (Platform: {platform}, Category: {selected_cat})")
+                st.markdown(f"- Total threads fetched: {len(metadata_list)}")
+                st.markdown(f"- Threads with replies ≥ {min_replies}: {len(filtered_items)}")
                 
                 if filtered_items:
-                    st.markdown("#### 符合條件的帖子：")
+                    st.markdown("#### Qualifying Threads:")
                     for item in filtered_items:
-                        st.markdown(f"- 帖子 ID: {item['thread_id']}，標題: {item['title']}，回覆數: {item['no_of_reply']}，最後回覆時間: {item['last_reply_time']}")
+                        st.markdown(f"- Thread ID: {item['thread_id']}, Title: {item['title']}, Replies: {item['no_of_reply']}, Last Reply: {item['last_reply_time']}")
                 else:
-                    st.markdown("無符合條件的帖子。")
-                    logger.warning("無符合條件的帖子，可能數據不足或篩選條件過嚴")
+                    st.markdown("No qualifying threads found.")
+                    logger.warning("No qualifying threads, possibly due to insufficient data or strict filters")
         
         st.markdown("---")
-        st.markdown("### 查詢帖子回覆數")
-        thread_id_input = st.text_input("輸入帖子 ID", placeholder="例如：3913444")
-        if st.button("查詢回覆數"):
+        st.markdown("### Query Thread Reply Count")
+        thread_id_input = st.text_input("Enter Thread ID", placeholder="e.g., 7929703")
+        if st.button("Query Reply Count"):
             if thread_id_input:
                 try:
                     thread_id = int(thread_id_input)
-                    with st.spinner(f"正在查詢帖子 {thread_id} 的信息..."):
-                        logger.info(f"查詢帖子信息: platform={platform}, thread_id={thread_id}")
+                    with st.spinner(f"Querying thread {thread_id} info..."):
+                        logger.info(f"Querying thread info: platform={platform}, thread_id={thread_id}")
                         thread_data = await search_thread_by_id(thread_id, platform)
                         
                         if thread_data:
-                            thread_title = thread_data.get("title", "未知標題")
+                            thread_title = thread_data.get("title", "Unknown title")
                             reply_count = thread_data.get("no_of_reply", 0)
                             last_reply_time = (
                                 datetime.fromtimestamp(int(thread_data.get("last_reply_time", 0)), tz=HONG_KONG_TZ)
                                 .strftime("%Y-%m-%d %H:%M:%S")
                                 if thread_data.get("last_reply_time")
-                                else "未知"
+                                else "Unknown"
                             )
                             
-                            st.markdown("#### 查詢結果")
-                            st.markdown(f"- 帖子 ID: {thread_id}")
-                            st.markdown(f"- 標題: {thread_title}")
-                            st.markdown(f"- 回覆數: {reply_count}")
-                            st.markdown(f"- 最後回覆時間: {last_reply_time}")
+                            st.markdown("#### Query Results")
+                            st.markdown(f"- Thread ID: {thread_id}")
+                            st.markdown(f"- Title: {thread_title}")
+                            st.markdown(f"- Reply Count: {reply_count}")
+                            st.markdown(f"- Last Reply Time: {last_reply_time}")
                         else:
-                            st.markdown(f"未找到帖子 ID {thread_id} 的信息。")
-                            logger.warning(f"查詢失敗: thread_id={thread_id}")
+                            st.markdown(f"No info found for thread ID {thread_id}.")
+                            logger.warning(f"Query failed: thread_id={thread_id}")
                 except ValueError:
-                    st.error("請輸入有效的帖子 ID（數字）。")
-                    logger.error(f"無效的帖子 ID: {thread_id_input}")
+                    st.error("Please enter a valid thread ID (numeric).")
+                    logger.error(f"Invalid thread ID: {thread_id_input}")

@@ -7,9 +7,9 @@ import streamlit.logger
 import time
 import random
 from datetime import datetime
-from config import LIHKG_API, HKGOLDEN_API
-from grok3_client import stream_grok3_response
-import re
+from config import LIHKG_API, HKGOLDEN_API, GROK3_API
+import aiohttp
+import json
 from threading import Lock
 
 logger = streamlit.logger.get_logger(__name__)
@@ -33,10 +33,55 @@ def score_item(item, current_time):
 
 def clean_reply_text(text):
     """清理回覆中的 HTML 標籤，保留純文字"""
+    import re
     text = re.sub(r'<img[^>]+alt="\[([^\]]+)\]"[^>]*>', r'[\1]', text)
     text = clean_html(text)
     text = ' '.join(text.split())
     return text
+
+async def call_grok3_api(prompt):
+    """非流式調用 Grok 3 API"""
+    try:
+        api_key = st.secrets["grok3key"]
+    except KeyError:
+        logger.error("Grok 3 API key is missing in Streamlit secrets (grok3key).")
+        return {"error": "Grok 3 API key is missing."}
+    
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+    
+    payload = {
+        "model": GROK3_API["MODEL"],
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": GROK3_API["MAX_TOKENS"],
+        "stream": False
+    }
+    
+    async with aiohttp.ClientSession() as session:
+        try:
+            start_time = time.time()
+            logger.info(f"Sending Grok 3 API request: prompt_length={len(prompt)}")
+            async with session.post(
+                f"{GROK3_API['BASE_URL']}/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=300  # 增加超時到 300 秒
+            ) as response:
+                elapsed_time = time.time() - start_time
+                response_text = await response.text()
+                logger.info(f"Grok 3 API response: status={response.status}, elapsed={elapsed_time:.2f}s")
+                if response.status != 200:
+                    logger.error(f"Grok 3 API failed: status={response.status}, reason={response_text}")
+                    return {"error": f"API request failed with status {response.status}: {response_text}"}
+                data = json.loads(response_text)
+                content = data.get("choices", [{}])[0].get("message", {}).get("content", "No content")
+                return {"content": content}
+        except Exception as e:
+            logger.error(f"Grok 3 API error: type={type(e).__name__}, message={str(e)}")
+            return {"error": str(e)}
 
 async def process_user_question(question, platform, cat_id_map, selected_cat):
     """處理用戶問題並返回相關帖子數據"""
@@ -49,7 +94,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat):
             current_time - st.session_state.get("last_processed_time", 0) < 5):
             logger.warning("Skipping duplicate process_user_question call")
             return st.session_state.get("last_result", {
-                "response": "重複請求，請稍後重試。",
+                "response": "重複請求，請稍後再試。",
                 "rate_limit_info": [],
                 "processed_data": []
             })
@@ -60,6 +105,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat):
     
     cat_id = cat_id_map[selected_cat]
     
+    start_fetch_time = time.time()
     if platform == "LIHKG":
         result = await get_lihkg_topic_list(
             cat_id=cat_id,
@@ -80,6 +126,8 @@ async def process_user_question(question, platform, cat_id_map, selected_cat):
             last_reset=st.session_state.get("last_reset", time.time()),
             rate_limit_until=st.session_state.get("rate_limit_until", 0)
         )
+    fetch_elapsed = time.time() - start_fetch_time
+    logger.info(f"Fetch completed: platform={platform}, category={selected_cat}, elapsed={fetch_elapsed:.2f}s")
     
     items = result["items"]
     rate_limit_info = result["rate_limit_info"]
@@ -149,46 +197,45 @@ async def process_user_question(question, platform, cat_id_map, selected_cat):
             "processed_data": []
         }
     
-    cleaned_replies = [clean_reply_text(r["msg"])[:100] + '...' if len(clean_reply_text(r["msg"])) > 100 else clean_reply_text(r["msg"]) for r in replies[:3]]
+    # 限制回覆數量和長度以簡化提示
+    cleaned_replies = [clean_reply_text(r["msg"])[:50] + '...' if len(clean_reply_text(r["msg"])) > 50 else clean_reply_text(r["msg"]) for r in replies[:2]]
     prompt = f"""
-You are Grok, embodying the collective voice of 高登討論區. Your role is to share a post that is highly engaging, insightful, or representative of the platform's discussions. Below is a selected post from the 聊天 category, chosen for its high reply count ({selected_item["no_of_reply"]}), strong rating ({selected_item["rt"]}), and recent activity (last reply: {datetime.fromtimestamp(selected_item["lrt"]).strftime('%Y-%m-%d %H:%M:%S')}).
+You are Grok, sharing a notable post from 高登討論區. Below is a selected post from the {selected_cat} category, chosen for high engagement ({selected_item["no_of_reply"]} replies, rating {selected_item["rt"]}) and recent activity (last reply: {datetime.fromtimestamp(selected_item["lrt"]).strftime('%Y-%m-%d %H:%M:%S')}).
 
 Post data:
 - ID: {thread_id}
 - Title: {thread_title}
-- Number of replies: {selected_item["no_of_reply"]}
-- Rating: {selected_item["rt"]}
-- Last reply time: {datetime.fromtimestamp(selected_item["lrt"]).strftime('%Y-%m-%d %H:%M:%S')}
 - Replies: {', '.join(cleaned_replies)}
 
-Generate a concise sharing text (max 280 characters) that highlights why this post is worth sharing, includes the post's title, reply count, rating, and a snippet of the first meaningful reply. Explain why you chose it (e.g., high engagement, insightful replies).
+Generate a concise sharing text (max 280 characters) highlighting why this post is engaging, including the title, reply count, and a snippet of the first reply.
 
 Example:
-This 高登討論區 post is buzzing with {selected_item["no_of_reply"]} replies and a {selected_item["rt"]} rating! "{thread_title[:50]}" sparks debate. First reply: "{cleaned_replies[0][:50]}". Chosen for its lively discussion!
+Hot 高登 post with {selected_item["no_of_reply"]} replies! "{thread_title[:50]}" sparks debate. First reply: "{cleaned_replies[0][:50]}". Chosen for lively discussion!
 
 {{ output }}
 """
     
     logger.info(f"Generated Grok 3 prompt (length={len(prompt)} chars)")
     
-    response_text = ""
-    async for chunk in stream_grok3_response(prompt):
-        response_text += chunk
+    start_api_time = time.time()
+    api_result = await call_grok3_api(prompt)
+    api_elapsed = time.time() - start_api_time
+    logger.info(f"Grok 3 API call completed: elapsed={api_elapsed:.2f}s")
     
-    if "Error" in response_text:
-        logger.warning(f"Falling back to local response due to Grok 3 API failure: {response_text}")
+    if "error" in api_result:
+        logger.warning(f"Falling back to local response due to Grok 3 API failure: {api_result['error']}")
         first_reply = cleaned_replies[0][:50] if cleaned_replies else "無回覆"
         response = f"""
-Hot thread on 高登討論區 with {selected_item["no_of_reply"]} replies and a {selected_item["rt"]} rating! "{thread_title[:50]}" sparks fierce debate. First reply: "{first_reply}". Chosen for its massive engagement!
+Hot thread on 高登討論區 with {selected_item["no_of_reply"]} replies! "{thread_title[:50]}" sparks debate. First reply: "{first_reply}". Chosen for high engagement!
 
 Details:
 - ID: {thread_id}
 - Title: {thread_title}
 """
-        for i, data in enumerate(processed_data[:3], 1):
-            response += f"\n回覆 {i}：{data['content']}\n讚好：{data['like_count']}，點踩：{data['dislike_count']}\n"
+        for i, data in enumerate(processed_data[:2], 1):
+            response += f"\n回覆 {i}：{data['content'][:50]}...\n讚好：{data['like_count']}，點踩：{data['dislike_count']}\n"
     else:
-        response = response_text.strip()
+        response = api_result["content"].strip()
     
     result = {
         "response": response,

@@ -300,7 +300,7 @@ async def get_hkgolden_thread_content(thread_id, cat_id=None, request_counter=0,
     if cache_key in st.session_state.thread_content_cache:
         cache_data = st.session_state.thread_content_cache[cache_key]
         if time.time() - cache_data["timestamp"] < HKGOLDEN_API["CACHE_DURATION"]:
-            logger.info(f"Using thread content cache: id={thread_id}")
+            logger.info(f"Cache hit for id={thread_id}, replies={len(cache_data['data']['replies'])}")
             return cache_data["data"]
     
     device_id = hashlib.sha1(str(uuid.uuid4()).encode()).hexdigest()
@@ -342,7 +342,7 @@ async def get_hkgolden_thread_content(thread_id, cat_id=None, request_counter=0,
         }
     
     async with aiohttp.ClientSession() as session:
-        logger.info(f"Fetching id={thread_id}, pages=1-all")
+        logger.debug(f"Fetching id={thread_id}, pages=1-all")
         while True:
             if current_time - last_reset >= 60:
                 request_counter = 0
@@ -423,8 +423,8 @@ async def get_hkgolden_thread_content(thread_id, cat_id=None, request_counter=0,
                         standardized_replies = [
                             {
                                 "msg": reply.get("content", ""),
-                                "like_count": reply.get("like_count", 0),  # 若 API 提供
-                                "dislike_count": reply.get("dislike_count", 0)  # 若 API 提供
+                                "like_count": reply.get("like_count", 0),
+                                "dislike_count": reply.get("dislike_count", 0)
                             }
                             for reply in new_replies
                         ]

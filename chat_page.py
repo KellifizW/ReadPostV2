@@ -228,8 +228,7 @@ async def chat_page():
                         "timestamp": time.time()
                     }
                 except Exception as e:
-                    result = {"rate_limit_info": [], "response": "", "analysis": None}
-                    debug_info = [f"#### 調試信息：\n- 處理錯誤: 原因={str(e)}"]
+                    debug_info.append(f"#### 調試信息：\n- 處理錯誤: 原因={str(e)}")
                     error_message = f"處理失敗，原因：{str(e)}。請檢查問題格式或稍後重試。"
                     placeholder.markdown(error_message)
                     st.session_state.chat_history.append({
@@ -243,8 +242,10 @@ async def chat_page():
                     return
             
             response = result.get("response")
+            response_text = ""
             try:
                 if isinstance(response, str):
+                    # 直接處理字符串回應
                     response = response.strip()
                     response = re.sub(r'\{\{ output \}\}|\{ output \}', '', response).strip()
                     
@@ -259,28 +260,35 @@ async def chat_page():
                     if reason_match:
                         reason = reason_match.group(1).strip()
                     
-                    if share_text != "無分享文字":
-                        placeholder.markdown(f"**分享文字**：{share_text}")
-                    if reason != "無選擇理由":
-                        placeholder.markdown(f"**選擇理由**：{reason}")
+                    response_text = f"**分享文字**：{share_text}\n\n**選擇理由**：{reason}"
+                    placeholder.markdown(response_text)
                 else:
-                    # 改進 st.write_stream，收集所有塊並處理錯誤
+                    # 處理生成器，逐塊顯示並收集字符串
                     full_response = []
                     try:
-                        for chunk in st.write_stream(response):
-                            full_response.append(chunk)
+                        async for chunk in response:  # 直接迭代生成器
+                            if isinstance(chunk, str):
+                                full_response.append(chunk)
+                                placeholder.markdown("".join(full_response), unsafe_allow_html=True)
+                                await asyncio.sleep(0.05)  # 模擬打字機效果
+                            else:
+                                logger.warning(f"Non-string chunk received: {chunk}")
+                                full_response.append(str(chunk))
                         response_text = "".join(full_response)
-                        placeholder.markdown(response_text)
+                        if not response_text:
+                            response_text = "無回應內容，請稍後重試。"
+                            placeholder.markdown(response_text)
                     except Exception as e:
                         debug_info.append(f"#### 調試信息：\n- 流式處理錯誤: 原因={str(e)}")
                         error_message = f"無法顯示回應，API 連接失敗：{str(e)}。請稍後重試。"
-                        placeholder.markdown(error_message)
+                        full_response.append(error_message)
                         response_text = error_message
+                        placeholder.markdown(response_text)
             except Exception as e:
                 debug_info.append(f"#### 調試信息：\n- 處理錯誤: 原因={str(e)}")
-                error_message = f"無法顯示回應，處理失敗：{str(e)}。請稍後重試。"
-                placeholder.markdown(error_message)
+                error_message = f"無法顯示回應，處理失敗：{str(e)}。請檢查問題格式或稍後重試。"
                 response_text = error_message
+                placeholder.markdown(error_message)
             
             if result.get("rate_limit_info"):
                 debug_info.append("#### 調試信息：")

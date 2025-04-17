@@ -5,6 +5,7 @@ import pytz
 import re
 from data_processor import process_user_question
 import time
+import traceback
 from config import LIHKG_API, HKGOLDEN_API, GENERAL
 import streamlit.logger
 
@@ -141,8 +142,7 @@ async def chat_page():
                         "timestamp": time.time()
                     }
                 except Exception as e:
-                    result = {"rate_limit_info": [], "response": "", "analysis": None}
-                    debug_info = [f"#### 調試信息：\n- 處理錯誤: 原因={str(e)}"]
+                    debug_info = [f"#### 調試信息：\n- 處理錯誤: 原因={str(e)}\n- 堆棧跟踪: {traceback.format_exc()}"]
                     error_message = f"生成提示失敗，原因：{str(e)}。請檢查問題格式或稍後重試。"
                     placeholder.markdown(error_message)
                     st.session_state.chat_history.append({
@@ -152,7 +152,7 @@ async def chat_page():
                         "is_preview": True,
                         "timestamp": current_time
                     })
-                    logger.error(f"Preview failed: question={user_input}, platform={platform}, error={str(e)}")
+                    logger.error(f"Preview failed: question={user_input}, platform={platform}, error={str(e)}, traceback={traceback.format_exc()}")
                     st.session_state.processing_request = False
                     return
             
@@ -228,7 +228,7 @@ async def chat_page():
                         "timestamp": time.time()
                     }
                 except Exception as e:
-                    debug_info.append(f"#### 調試信息：\n- 處理錯誤: 原因={str(e)}")
+                    debug_info.append(f"#### 調試信息：\n- 處理錯誤: 原因={str(e)}\n- 堆棧跟踪: {traceback.format_exc()}")
                     error_message = f"處理失敗，原因：{str(e)}。請檢查問題格式或稍後重試。"
                     placeholder.markdown(error_message)
                     st.session_state.chat_history.append({
@@ -237,7 +237,7 @@ async def chat_page():
                         "debug_info": debug_info,
                         "timestamp": current_time
                     })
-                    logger.error(f"Processing failed: question={user_input}, platform={platform}, error={str(e)}")
+                    logger.error(f"Processing failed: question={user_input}, platform={platform}, error={str(e)}, traceback={traceback.format_exc()}")
                     st.session_state.processing_request = False
                     return
             
@@ -266,46 +266,46 @@ async def chat_page():
                     # 使用 st.write_stream 處理異步生成器
                     full_response = []
                     try:
-                        # 使用現有事件循環迭代生成器
-                        async def async_to_sync_generator():
-                            try:
-                                async for chunk in response:
+                        # 定義同步生成器，迭代異步生成器
+                        def sync_generator():
+                            loop = asyncio.get_running_loop()
+                            iterator = response.__aiter__()
+                            while True:
+                                try:
+                                    chunk = loop.run_until_complete(iterator.__anext__())
                                     if isinstance(chunk, str):
                                         yield chunk
                                     else:
                                         logger.warning(f"Non-string chunk received: {chunk}")
                                         yield str(chunk)
-                            except Exception as e:
-                                logger.error(f"Stream error in async_to_sync_generator: error={str(e)}")
-                                yield f"無法顯示回應，API 連接失敗：{str(e)}。請稍後重試。\n"
-
-                        # 在現有事件循環中運行
-                        loop = asyncio.get_running_loop()
-                        iterator = async_to_sync_generator()
+                                except StopAsyncIteration:
+                                    break
+                                except Exception as e:
+                                    error_msg = f"無法顯示回應，API 連接失敗：{str(e)}。請稍後重試。\n"
+                                    logger.error(f"Stream error in sync_generator: error={str(e)}, traceback={traceback.format_exc()}")
+                                    yield error_msg
+                                    break
                         
                         # 使用 st.write_stream 迭代並收集結果
-                        response_text = st.write_stream(iterator)
-                        if isinstance(response_text, str):
-                            full_response.append(response_text)
-                        elif isinstance(response_text, list):
-                            full_response.extend(response_text)
+                        for chunk in st.write_stream(sync_generator()):
+                            full_response.append(chunk)
                         
                         # 確保非空回應
                         response_text = "".join(str(item) for item in full_response) if full_response else "無回應內容，請稍後重試。"
                         placeholder.markdown(response_text)
                     except Exception as e:
-                        logger.error(f"Stream processing error: error={str(e)}")
-                        debug_info.append(f"#### 調試信息：\n- 流式處理錯誤: 原因={str(e)}")
+                        debug_info.append(f"#### 調試信息：\n- 流式處理錯誤: 原因={str(e)}\n- 堆棧跟踪: {traceback.format_exc()}")
                         error_message = f"無法顯示回應，API 連接失敗：{str(e)}。請稍後重試。"
                         full_response.append(error_message)
                         response_text = error_message
                         placeholder.markdown(response_text)
+                        logger.error(f"Stream processing error: error={str(e)}, traceback={traceback.format_exc()}")
             except Exception as e:
-                logger.error(f"General processing error: error={str(e)}")
-                debug_info.append(f"#### 調試信息：\n- 處理錯誤: 原因={str(e)}")
+                debug_info.append(f"#### 調試信息：\n- 處理錯誤: 原因={str(e)}\n- 堆棧跟踪: {traceback.format_exc()}")
                 error_message = f"無法顯示回應，處理失敗：{str(e)}。請檢查問題格式或稍後重試。"
                 response_text = error_message
                 placeholder.markdown(error_message)
+                logger.error(f"General processing error: error={str(e)}, traceback={traceback.format_exc()}")
             
             if result.get("rate_limit_info"):
                 debug_info.append("#### 調試信息：")

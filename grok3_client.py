@@ -9,8 +9,7 @@ logger = streamlit.logger.get_logger(__name__)
 
 async def stream_grok3_response(prompt: str) -> AsyncGenerator[str, None]:
     """Stream response from Grok 3 API"""
-    # 確認 GROK3_API 是否正確加載
-    logger.info(f"GROK3_API loaded: {GROK3_API}")
+    logger.info(f"Sending Grok 3 prompt: {prompt}")
     
     if GROK3_API["API_KEY"] == "YOUR_GROK3_API_KEY":
         logger.warning("GROK3_API_KEY is a placeholder. Please configure a valid API key in config.py.")

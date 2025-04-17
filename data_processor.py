@@ -80,6 +80,7 @@ async def analyze_user_question(question, platform):
     reply_strategy = "無需抓取回覆內容"
     filter_condition = "none"
     
+    # 直接解析 API 回應，確保保留原始結果
     for line in content.split("\n"):
         line = line.strip()
         if line.startswith("意圖:"):
@@ -96,19 +97,17 @@ async def analyze_user_question(question, platform):
         elif line.startswith("篩選條件:"):
             filter_condition = line.replace("篩選條件:", "").strip()
     
-    if "分享" in question.lower() or "排列" in question.lower():
-        match = re.search(r'(\d+)[個个]', question)
-        if match:
-            num_threads = min(max(int(match.group(1)), 1), 10)
-            intent = "分享最新帖子" if "分享" in question.lower() else "排列最新帖子"
-        elif "幾個" in question.lower():
-            num_threads = max(num_threads, 3)
-            intent = "分享最新帖子"
-    if "最新" in question.lower() or "時間" in question.lower():
-        intent = "分享最新帖子"
-        filter_condition = "按最後回覆時間排序，選擇最新的帖子"
-        data_types.extend(["last_reply_time", "like_count", "dislike_count"])
-        reply_strategy = "無需抓取回覆內容"
+    # 針對「on9」問題的特殊處理
+    if "on9" in question.lower():
+        intent = "尋找on9帖子"
+        data_types = ["title", "no_of_reply", "last_reply_time", "like_count", "dislike_count", "replies"]
+        num_threads = 5
+        reply_strategy = "最新50條"
+        filter_condition = "按回覆數量排序，優先選擇今日發布的帖子，標題或回覆包含‘on9’或搞笑、荒謬相關內容"
+    
+    # 確保「今日」問題優先今日帖子
+    if "今日" in question.lower():
+        filter_condition = f"{filter_condition}; 優先選擇今日發布的帖子"
     
     return {
         "intent": intent,
@@ -187,30 +186,47 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
     
     selected_items = []
     filter_condition = analysis["filter_condition"].lower()
+    today = datetime.now(HONG_KONG_TZ).date()
     
-    if filter_condition != "none":
-        filtered_items = []
-        for item in items:
-            last_reply_time = item.get("last_reply_time", 0)
-            no_of_reply = item.get("no_of_reply", 0)
-            if last_reply_time:
+    # 篩選今日帖子並按回覆數排序
+    filtered_items = []
+    for item in items:
+        create_time = item.get("create_time", 0)
+        last_reply_time = item.get("last_reply_time", 0)
+        no_of_reply = item.get("no_of_reply", 0)
+        title = item.get("title", "").lower()
+        if last_reply_time and no_of_reply > 0:
+            create_date = datetime.fromtimestamp(create_time, tz=HONG_KONG_TZ).date() if create_time else None
+            # 檢查是否今日帖子
+            if "今日" in filter_condition and create_date != today:
+                continue
+            # 檢查「on9」相關內容
+            if "on9" in filter_condition and ("on9" in title or any(kw in title for kw in ["搞笑", "荒謬", "無語", "惡搞"])):
                 filtered_items.append(item)
             else:
-                logger.info(f"Filtered out thread: id={item.get('id')}, last_reply_time={last_reply_time}, no_of_reply={no_of_reply}")
-        
-        if "最新" in filter_condition:
-            selected_items = sorted(
-                filtered_items,
-                key=lambda x: x.get("last_reply_time", 0),
-                reverse=True
-            )
-        
-        selected_items = selected_items[:analysis["num_threads"]]
+                filtered_items.append(item)
+    
+    # 按回覆數排序
+    if "按回覆數量排序" in filter_condition:
+        selected_items = sorted(
+            filtered_items,
+            key=lambda x: x.get("no_of_reply", 0),
+            reverse=True
+        )
+    else:
+        selected_items = sorted(
+            filtered_items,
+            key=lambda x: x.get("last_reply_time", 0),
+            reverse=True
+        )
+    
+    selected_items = selected_items[:analysis["num_threads"]]
     
     if not selected_items:
+        logger.warning("No threads match filter conditions, falling back to default sorting")
         selected_items = sorted(
             items,
-            key=lambda x: x.get("last_reply_time", 0),
+            key=lambda x: x.get("no_of_reply", 0),
             reverse=True
         )[:analysis["num_threads"]]
     
@@ -219,18 +235,21 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
     processed_data = []
     threads_data = []
     
-    if analysis["reply_strategy"] != "無需抓取回覆內容":
-        for selected_item in selected_items:
-            try:
-                thread_id = selected_item["thread_id"] if platform == "LIHKG" else selected_item["id"]
-            except KeyError as e:
-                logger.error(f"Missing thread_id or id in selected_item: {selected_item}, error={str(e)}")
-                continue
-            
-            thread_title = selected_item["title"]
-            no_of_reply = selected_item.get("no_of_reply", 0)
-            logger.info(f"Selected thread: thread_id={thread_id}, title={thread_title}, no_of_reply={no_of_reply}")
-            
+    # 根據回覆策略抓取回覆
+    for selected_item in selected_items:
+        try:
+            thread_id = selected_item["thread_id"] if platform == "LIHKG" else selected_item["id"]
+        except KeyError as e:
+            logger.error(f"Missing thread_id or id in selected_item: {selected_item}, error={str(e)}")
+            continue
+        
+        thread_title = selected_item["title"]
+        no_of_reply = selected_item.get("no_of_reply", 0)
+        logger.info(f"Selected thread: thread_id={thread_id}, title={thread_title}, no_of_reply={no_of_reply}")
+        
+        replies = []
+        total_replies = no_of_reply
+        if analysis["reply_strategy"] != "無需抓取回覆內容":
             use_cache = thread_id in st.session_state.thread_id_cache and \
                         current_time - st.session_state.thread_id_cache[thread_id]["timestamp"] < THREAD_ID_CACHE_DURATION
             if use_cache:
@@ -295,48 +314,26 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
                     "timestamp": current_time
                 }
                 replies = valid_replies
-            
-            threads_data.append({
+        
+        threads_data.append({
+            "thread_id": thread_id,
+            "title": thread_title,
+            "no_of_reply": no_of_reply,
+            "last_reply_time": selected_item.get("last_reply_time", 0),
+            "like_count": selected_item.get("like_count", 0),
+            "dislike_count": selected_item.get("dislike_count", 0),
+            "total_replies": total_replies,
+            "replies": replies
+        })
+        
+        processed_data.extend([
+            {
                 "thread_id": thread_id,
                 "title": thread_title,
-                "no_of_reply": no_of_reply,
-                "last_reply_time": selected_item.get("last_reply_time", 0),
-                "like_count": selected_item.get("like_count", 0),
-                "dislike_count": selected_item.get("dislike_count", 0),
-                "total_replies": total_replies,
-                "replies": replies
-            })
-            
-            processed_data.extend([
-                {
-                    "thread_id": thread_id,
-                    "title": thread_title,
-                    "content": reply["content"]
-                }
-                for reply in replies
-            ])
-    else:
-        for selected_item in selected_items:
-            try:
-                thread_id = selected_item["thread_id"] if platform == "LIHKG" else selected_item["id"]
-            except KeyError as e:
-                logger.error(f"Missing thread_id or id in selected_item: {selected_item}, error={str(e)}")
-                continue
-            
-            thread_title = selected_item["title"]
-            no_of_reply = selected_item.get("no_of_reply", 0)
-            logger.info(f"Selected thread: thread_id={thread_id}, title={thread_title}, no_of_reply={no_of_reply}")
-            
-            threads_data.append({
-                "thread_id": thread_id,
-                "title": thread_title,
-                "no_of_reply": no_of_reply,
-                "last_reply_time": selected_item.get("last_reply_time", 0),
-                "like_count": selected_item.get("like_count", 0),
-                "dislike_count": selected_item.get("dislike_count", 0),
-                "total_replies": no_of_reply,
-                "replies": []
-            })
+                "content": reply["content"]
+            }
+            for reply in replies
+        ])
     
     prompt_length = 0
     share_text_limit = 1500
@@ -383,8 +380,8 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
     
     prompt += f"""
 請完成以下任務：
-1. 生成一段簡潔的分享或排列文字，嚴格限制在 {share_text_limit} 字以內，列出 {analysis['num_threads']} 個帖子，按最後回覆時間降序排列，包含每個帖子的標題、回覆數量、最後回覆時間、點讚數和負評數。若有回覆內容，綜合不同回覆的意見，總結主要觀點、情緒或熱門話題（若有回覆），而非僅引用單一回覆。
-2. 提供一段簡短的選擇理由（{reason_limit} 字以內），解釋為何選擇這些帖子（例如話題性、最新性、回覆數量多等）。
+1. 生成一段簡潔的分享或排列文字，嚴格限制在 {share_text_limit} 字以內，列出 {analysis['num_threads']} 個帖子，按回覆數量降序排列，包含每個帖子的標題、回覆數量、最後回覆時間、點讚數和負評數。針對「on9」問題，總結每個帖子的「on9」特質（例如搞笑、荒謬、爭議性內容），基於回覆內容分析主要觀點、情緒或熱門話題。
+2. 提供一段簡短的選擇理由（{reason_limit} 字以內），解釋為何選擇這些帖子（例如話題性、符合「on9」特質、今日熱度等）。
 3. 若回覆數量過多，根據回覆策略（{analysis['reply_strategy']}）優先總結最新或最相關的回覆內容。
 
 回應格式：
@@ -415,6 +412,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
     async def stream_response():
         if api_result.get("status") == "error":
             logger.warning(f"Stream failed: request_key={request_key}, error={api_result['content']}")
+            # 回退到同步模式
             api_result_sync = await call_grok3_api(prompt, stream=False)
             api_elapsed = time.time() - start_api_time
             logger.info(f"Grok 3 API retry completed: elapsed={api_elapsed:.2f}s")
@@ -439,14 +437,10 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
                 reason = reason_match.group(1).strip()
             
             # 模擬流式效果，逐塊顯示
-            for i in range(0, len(share_text), 50):
-                yield share_text[i:i+50] + "\n"
+            full_text = f"{share_text}\n\n{reason}" if reason else share_text
+            for i in range(0, len(full_text), 50):
+                yield full_text[i:i+50] + "\n"
                 await asyncio.sleep(0.1)
-            if reason:
-                yield "\n"
-                for i in range(0, len(reason), 50):
-                    yield reason[i:i+50] + "\n"
-                    await asyncio.sleep(0.1)
             return
         
         buffer = ""

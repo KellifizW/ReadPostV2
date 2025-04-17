@@ -60,13 +60,13 @@ async def chat_page():
                     share_text = "無分享文字"
                     reason = "無選擇理由"
                     
-                    share_match = re.search(r'分享文字：\s*(.*?)(?=\n選擇理由：|\Z)', response, re.DOTALL)
+                    share_match = re.search(r'分享文字：\s*(.*?)(?=\n*選擇理由：|\Z)', response, re.DOTALL)
                     reason_match = re.search(r'選擇理由：\s*(.*)', response, re.DOTALL)
                     
                     if share_match:
                         share_text = share_match.group(1).strip()
                     if reason_match:
-                        reason = share_match.group(1).strip()
+                        reason = reason_match.group(1).strip()
                     
                     if share_text != "無分享文字":
                         st.markdown(f"**分享文字**：{share_text}")
@@ -141,12 +141,9 @@ async def chat_page():
                         "timestamp": time.time()
                     }
                 except Exception as e:
-                    result = {}
+                    result = {"rate_limit_info": [], "response": "", "analysis": None}  # 定義默認 result
                     debug_info = [f"#### 調試信息：\n- 處理錯誤: 原因={str(e)}"]
-                    if result.get("rate_limit_info"):
-                        debug_info.append("- 速率限制或錯誤記錄：")
-                        debug_info.extend(f"  - {info}" for info in result["rate_limit_info"])
-                    error_message = f"生成提示失敗，原因：{str(e)}。請稍後重試或檢查 API 配置。"
+                    error_message = f"生成提示失敗，原因：{str(e)}。請檢查問題格式或稍後重試。"
                     placeholder.markdown(error_message)
                     st.session_state.chat_history.append({
                         "question": user_input,
@@ -217,27 +214,6 @@ async def chat_page():
             if use_cache:
                 logger.info(f"Using cache: platform={platform}, category={selected_cat}, question={user_input}")
                 result = st.session_state.thread_content_cache[cache_key]["data"]
-                response = result.get("response")
-                if isinstance(response, str):
-                    response = response.strip()
-                    response = re.sub(r'\{\{ output \}\}|\{ output \}', '', response).strip()
-                    
-                    share_text = "無分享文字"
-                    reason = "無選擇理由"
-                    
-                    share_match = re.search(r'分享文字：\s*(.*?)(?=\n選擇理由：|\Z)', response, re.DOTALL)
-                    reason_match = re.search(r'選擇理由：\s*(.*)', response, re.DOTALL)
-                    
-                    if share_match:
-                        share_text = share_match.group(1).strip()
-                    if reason_match:
-                        reason = reason_match.group(1).strip()
-                    
-                    placeholder.markdown(f"**分享文字**：{share_text}")
-                    if reason != "無選擇理由":
-                        placeholder.markdown(f"**選擇理由**：{reason}")
-                else:
-                    placeholder.write_stream(response)
             else:
                 try:
                     logger.info(f"Calling process_user_question: question={user_input}, platform={platform}, category={selected_cat}")
@@ -251,32 +227,10 @@ async def chat_page():
                         "data": result,
                         "timestamp": time.time()
                     }
-                    
-                    response = result.get("response")
-                    if isinstance(response, str):
-                        response = response.strip()
-                        response = re.sub(r'\{\{ output \}\}|\{ output \}', '', response).strip()
-                        
-                        share_text = "無分享文字"
-                        reason = "無選擇理由"
-                        
-                        share_match = re.search(r'分享文字：\s*(.*?)(?=\n選擇理由：|\Z)', response, re.DOTALL)
-                        reason_match = re.search(r'選擇理由：\s*(.*)', response, re.DOTALL)
-                        
-                        if share_match:
-                            share_text = share_match.group(1).strip()
-                            placeholder.markdown(f"**分享文字**：{share_text}")
-                        if reason_match:
-                            reason = reason_match.group(1).strip()
-                            placeholder.markdown(f"**選擇理由**：{reason}")
-                    else:
-                        placeholder.write_stream(response)
                 except Exception as e:
+                    result = {"rate_limit_info": [], "response": "", "analysis": None}  # 定義默認 result
                     debug_info = [f"#### 調試信息：\n- 處理錯誤: 原因={str(e)}"]
-                    if result.get("rate_limit_info"):
-                        debug_info.append("- 速率限制或錯誤記錄：")
-                        debug_info.extend(f"  - {info}" for info in result["rate_limit_info"])
-                    error_message = f"處理失敗，原因：{str(e)}。請稍後重試或檢查 API 配置。"
+                    error_message = f"處理失敗，原因：{str(e)}。請檢查問題格式或稍後重試。"
                     placeholder.markdown(error_message)
                     st.session_state.chat_history.append({
                         "question": user_input,
@@ -287,6 +241,26 @@ async def chat_page():
                     logger.error(f"Processing failed: question={user_input}, platform={platform}, error={str(e)}")
                     st.session_state.processing_request = False
                     return
+            
+            response = result.get("response")
+            if isinstance(response, str):
+                response = response.strip()
+                response = re.sub(r'\{\{ output \}\}|\{ output \}', '', response).strip()
+                
+                share_text = "無分享文字"
+                reason = "無選擇理由"
+                
+                share_match = re.search(r'分享文字：\s*(.*?)(?=\n*選擇理由：|\Z)', response, re.DOTALL)
+                reason_match = re.search(r'選擇理由：\s*(.*)', response, re.DOTALL)
+                
+                if share_match:
+                    share_text = share_match.group(1).strip()
+                    placeholder.markdown(f"**分享文字**：{share_text}")
+                if reason_match:
+                    reason = reason_match.group(1).strip()
+                    placeholder.markdown(f"**選擇理由**：{reason}")
+            else:
+                placeholder.write_stream(response)
             
             if result.get("rate_limit_info"):
                 debug_info.append("#### 調試信息：")

@@ -1,4 +1,3 @@
-```python
 import streamlit as st
 import asyncio
 from datetime import datetime
@@ -148,5 +147,3 @@ async def chat_page():
     # 重置輸入狀態（在每次渲染結束後）
     if not user_input:
         st.session_state.input_processed = False
-
-```

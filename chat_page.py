@@ -61,6 +61,9 @@ async def chat_page():
                 share_text = "無分享文字"
                 reason = "無選擇理由"
                 
+                # 清理多餘的 { output } 標記
+                response = re.sub(r'\{\{ output \}\}', '', response).strip()
+                
                 # 使用正則表達式提取分享文字和選擇理由
                 share_match = re.search(r'分享文字：\s*(.*?)(?=\n選擇理由：|$)', response, re.DOTALL)
                 reason_match = re.search(r'選擇理由：\s*(.*)', response, re.DOTALL)
@@ -68,10 +71,13 @@ async def chat_page():
                 if share_match:
                     share_text = share_match.group(1).strip()
                 if reason_match:
-                    reason = reason_match.group(1).strip()  # 修正：使用 reason_match
+                    reason = reason_match.group(1).strip()
                 
-                st.markdown(f"**分享文字**：{share_text}")
-                st.markdown(f"**選擇理由**：{reason}")
+                # 確保顯示分享文字和選擇理由
+                if share_text != "無分享文字":
+                    st.markdown(f"**分享文字**：{share_text}")
+                if reason != "無選擇理由":
+                    st.markdown(f"**選擇理由**：{reason}")
             
             if chat.get("debug_info") or chat.get("analysis"):
                 with st.expander("調試信息"):
@@ -81,7 +87,7 @@ async def chat_page():
                         st.markdown(f"- 意圖：{analysis['intent']}")
                         st.markdown(f"- 數據類型：{', '.join(analysis['data_types'])}")
                         st.markdown(f"- 帖子數量：{analysis['num_threads']}")
-                        st.markdown(f"- 回覆數量：{analysis['num_replies']}")
+                        st.markdown(f"- 回覆策略：{analysis['reply_strategy']}")
                         st.markdown(f"- 篩選條件：{analysis['filter_condition']}")
                     if chat.get("debug_info"):
                         for info in chat["debug_info"]:
@@ -258,6 +264,9 @@ async def chat_page():
                     return
             
             response = result.get("response", "無回應內容")
+            # 清理多餘的 { output } 標記
+            response = re.sub(r'\{\{ output \}\}', '', response).strip()
+            
             # 使用正則表達式提取分享文字和選擇理由
             share_text = "無分享文字"
             reason = "無選擇理由"
@@ -268,10 +277,13 @@ async def chat_page():
             if share_match:
                 share_text = share_match.group(1).strip()
             if reason_match:
-                reason = reason_match.group(1).strip()  # 修正：使用 reason_match
+                reason = reason_match.group(1).strip()
             
-            placeholder.markdown(f"**分享文字**：{share_text}")
-            placeholder.markdown(f"**選擇理由**：{reason}")
+            # 確保顯示分享文字和選擇理由
+            if share_text != "無分享文字":
+                placeholder.markdown(f"**分享文字**：{share_text}")
+            if reason != "無選擇理由":
+                placeholder.markdown(f"**選擇理由**：{reason}")
             
             if result.get("rate_limit_info"):
                 debug_info.append("#### 調試信息：")

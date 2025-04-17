@@ -11,9 +11,9 @@ async def stream_grok3_response(prompt: str) -> AsyncGenerator[str, None]:
     """Stream response from Grok 3 API"""
     logger.info(f"Sending Grok 3 prompt: {prompt}")
     
-    if GROK3_API["API_KEY"] == "YOUR_GROK3_API_KEY":
-        logger.warning("GROK3_API_KEY is a placeholder. Please configure a valid API key in config.py.")
-        yield "Error: Invalid Grok 3 API key. Please configure a valid key in config.py."
+    if not GROK3_API["API_KEY"]:
+        logger.error("Grok 3 API key is missing in Streamlit secrets (grok3key).")
+        yield "Error: Grok 3 API key is missing. Please configure 'grok3key' in Streamlit secrets."
         return
     
     headers = {

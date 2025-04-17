@@ -54,6 +54,23 @@ def get_api_topic_details_key(thread_id: int, page: int, user_id: str = "%GUEST%
     filter_mode = "N"
     return hashlib.md5(f"{date_string}_HKGOLDEN_{user_id}_$API#Android_1_2^{thread_id}_{start}_{filter_mode}_N".encode()).hexdigest()
 
+def filter_items(items, current_time_ms):
+    """篩選帖子，根據熱度、質量、新鮮度"""
+    filtered_items = []
+    for item in items:
+        try:
+            # 篩選條件
+            is_active = item["nor"] >= 10  # 回覆數 >= 10
+            is_quality = item["rt"] >= 3  # 評分 >= 3
+            is_recent = item["lrt"] * 1000 >= (current_time_ms - 24 * 3600 * 1000)  # 最近 24 小時
+            if is_active and is_quality and is_recent:
+                filtered_items.append(item)
+        except (KeyError, TypeError) as e:
+            logger.error(f"Filter error: item={item}, error={str(e)}")
+            continue
+    logger.info(f"Filtered items: total={len(items)}, filtered={len(filtered_items)}")
+    return filtered_items
+
 async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, request_counter, last_reset, rate_limit_until):
     device_id = hashlib.sha1(str(uuid.uuid4()).encode()).hexdigest()
     headers = {
@@ -63,35 +80,37 @@ async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, req
         "Accept-Language": "zh-HK,zh-Hant;q=0.9,en;q=0.8",
         "Connection": "keep-alive",
         "Referer": f"{HKGOLDEN_API['BASE_URL']}/topics/{cat_id}",
+        "hkgauth": "null"
     }
     
     items = []
     rate_limit_info = []
+    data_structure_errors = []
     max_retries = 3
-    
-    current_time = time.time()
-    if current_time < rate_limit_until:
-        rate_limit_info.append(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} - API rate limit active, retry after {datetime.fromtimestamp(rate_limit_until)}")
-        logger.warning(f"API rate limit active, waiting until {datetime.fromtimestamp(rate_limit_until)}")
-        return {"items": items, "rate_limit_info": rate_limit_info, "request_counter": request_counter, "last_reset": last_reset, "rate_limit_until": rate_limit_until}
+    current_time_ms = int(time.time() * 1000)  # 用於篩選
     
     async with aiohttp.ClientSession() as session:
         for page in range(start_page, start_page + max_pages):
+            current_time = time.time()
+            if current_time < rate_limit_until:
+                rate_limit_info.append(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} - API rate limit active, retry after {datetime.fromtimestamp(rate_limit_until)}")
+                logger.warning(f"API rate limit active, waiting until {datetime.fromtimestamp(rate_limit_until)}")
+                break
+            
             if current_time - last_reset >= 60:
                 request_counter = 0
                 last_reset = current_time
             
             api_key = get_api_topics_list_key(cat_id, page)
             params = {
+                "thumb": "Y",
+                "sort": "0",
+                "sensormode": "Y",
+                "filtermodeS": "N",
+                "hideblock": "N",
+                "limit": "-1",
                 "s": api_key,
-                "type": cat_id,
-                "page": str(page),
-                "pagesize": "60",
                 "user_id": "0",
-                "block": "Y",
-                "sensormode": "N",
-                "filterMode": "N",
-                "hotOnly": "N",
                 "returntype": "json"
             }
             url = f"{HKGOLDEN_API['BASE_URL']}/v1/topics/{cat_id}/{page}"
@@ -167,7 +186,13 @@ async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, req
                         
                         # 提取帖子列表
                         data_content = data.get("data", {})
-                        logger.info(f"Data content for cat_id={cat_id}, page={page}: {data_content}")  # 記錄 data 內容
+                        logger.info(f"Data content for cat_id={cat_id}, page={page}: type={type(data_content)}, keys={list(data_content.keys()) if isinstance(data_content, dict) else []}")  # 記錄類型和鍵
+                        
+                        # 動態調整 max_pages
+                        if isinstance(data_content, dict) and "maxPage" in data_content:
+                            max_pages = min(max_pages, data_content["maxPage"], 10)  # 限制最大 10 頁
+                            fetch_conditions["max_pages"] = max_pages
+                        
                         new_items = data_content.get("list", [])  # 優先使用 data["data"]["list"]
                         
                         # 兼容其他可能的結構
@@ -181,19 +206,27 @@ async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, req
                         elif isinstance(data.get("data"), list):
                             new_items = data.get("data", [])  # 兼容舊結構
                         elif isinstance(data.get("data"), str):
-                            rate_limit_info.append(
-                                f"{current_time} - Data is a string, cannot parse: cat_id={cat_id}, page={page}, data={data['data']}"
+                            data_structure_errors.append(
+                                f"{current_time} - Data is a string: cat_id={cat_id}, page={page}, data={data['data'][:500]}"
                             )
                             logger.error(
-                                f"Data is a string: cat_id={cat_id}, page={page}, data={data['data']}, conditions={fetch_conditions}"
+                                f"Data is a string: cat_id={cat_id}, page={page}, data={data['data'][:500]}, conditions={fetch_conditions}"
+                            )
+                            break
+                        elif data.get("data") is None:
+                            data_structure_errors.append(
+                                f"{current_time} - Data is None: cat_id={cat_id}, page={page}"
+                            )
+                            logger.error(
+                                f"Data is None: cat_id={cat_id}, page={page}, conditions={fetch_conditions}"
                             )
                             break
                         else:
-                            rate_limit_info.append(
-                                f"{current_time} - Invalid data structure: cat_id={cat_id}, page={page}, data={data}"
+                            data_structure_errors.append(
+                                f"{current_time} - Invalid data structure: cat_id={cat_id}, page={page}, data_type={type(data['data'])}, data={str(data['data'])[:500]}"
                             )
                             logger.error(
-                                f"Invalid data structure: cat_id={cat_id}, page={page}, data={data}, conditions={fetch_conditions}"
+                                f"Invalid data structure: cat_id={cat_id}, page={page}, data_type={type(data['data'])}, data={str(data['data'])[:500]}, conditions={fetch_conditions}"
                             )
                             break
                         
@@ -201,37 +234,53 @@ async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, req
                         standardized_items = []
                         for item in new_items:
                             if not isinstance(item, dict):
-                                rate_limit_info.append(
-                                    f"{current_time} - Invalid item type: cat_id={cat_id}, page={page}, item={item}, type={type(item)}"
+                                data_structure_errors.append(
+                                    f"{current_time} - Invalid item type: cat_id={cat_id}, page={page}, item={str(item)[:500]}, type={type(item)}"
                                 )
                                 logger.error(
-                                    f"Invalid item type: cat_id={cat_id}, page={page}, item={item}, type={type(item)}, conditions={fetch_conditions}"
+                                    f"Invalid item type: cat_id={cat_id}, page={page}, item={str(item)[:500]}, type={type(item)}, conditions={fetch_conditions}"
                                 )
                                 continue
                             try:
                                 standardized_items.append({
-                                    "thread_id": item["id"],
+                                    "id": item["id"],
                                     "title": item.get("title", "Unknown title"),
-                                    "no_of_reply": item.get("totalReplies", 0),
-                                    "last_reply_time": item.get("lastReplyDate", 0) / 1000,  # 毫秒轉秒
-                                    "like_count": item.get("marksGood", 0),
-                                    "dislike_count": item.get("marksBad", 0)
+                                    "nor": item.get("totalReplies", 0),
+                                    "lrt": item.get("lastReplyDate", 0) / 1000,  # 毫秒轉秒
+                                    "rt": item.get("marksGood", 0) - item.get("marksBad", 0)
                                 })
                             except (TypeError, KeyError) as e:
-                                rate_limit_info.append(
-                                    f"{current_time} - Item parsing error: cat_id={cat_id}, page={page}, item={item}, error={str(e)}"
+                                data_structure_errors.append(
+                                    f"{current_time} - Item parsing error: cat_id={cat_id}, page={page}, item={str(item)[:500]}, error={str(e)}"
                                 )
                                 logger.error(
-                                    f"Item parsing error: cat_id={cat_id}, page={page}, item={item}, error={str(e)}, conditions={fetch_conditions}"
+                                    f"Item parsing error: cat_id={cat_id}, page={page}, item={str(item)[:500]}, error={str(e)}, conditions={fetch_conditions}"
                                 )
                                 continue
                         
+                        # 篩選帖子
+                        filtered_items = filter_items(standardized_items, current_time_ms)
                         logger.info(
                             f"Fetch successful: cat_id={cat_id}, page={page}, items={len(new_items)}, "
-                            f"standardized_items={len(standardized_items)}, conditions={fetch_conditions}"
+                            f"standardized_items={len(standardized_items)}, filtered_items={len(filtered_items)}, conditions={fetch_conditions}"
                         )
                         
-                        items.extend(standardized_items)
+                        # 獲取 total_replies
+                        for item in filtered_items:
+                            thread_data = await get_hkgolden_thread_content(
+                                thread_id=item["id"],
+                                cat_id=cat_id,
+                                request_counter=request_counter,
+                                last_reset=last_reset,
+                                rate_limit_until=rate_limit_until
+                            )
+                            item["tr"] = thread_data.get("tr", item["nor"])  # 默認使用 nor
+                            request_counter = thread_data.get("request_counter", request_counter)
+                            last_reset = thread_data.get("last_reset", last_reset)
+                            rate_limit_until = thread_data.get("rate_limit_until", rate_limit_until)
+                            rate_limit_info.extend(thread_data.get("rate_limit_info", []))
+                        
+                        items.extend(filtered_items)
                         break
                     
                 except Exception as e:
@@ -250,6 +299,7 @@ async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, req
     return {
         "items": items,
         "rate_limit_info": rate_limit_info,
+        "data_structure_errors": data_structure_errors,
         "request_counter": request_counter,
         "last_reset": last_reset,
         "rate_limit_until": rate_limit_until
@@ -291,7 +341,7 @@ async def get_hkgolden_thread_content(thread_id, cat_id=None, request_counter=0,
         return {
             "replies": replies,
             "title": thread_title,
-            "total_replies": total_replies,
+            "tr": total_replies,
             "rate_limit_info": rate_limit_info,
             "request_counter": request_counter,
             "last_reset": last_reset,
@@ -384,9 +434,7 @@ async def get_hkgolden_thread_content(thread_id, cat_id=None, request_counter=0,
                         
                         standardized_replies = [
                             {
-                                "msg": reply.get("content", ""),
-                                "like_count": reply.get("marksGood", 0),
-                                "dislike_count": reply.get("marksBad", 0)
+                                "msg": reply.get("content", "")
                             }
                             for reply in new_replies
                         ]
@@ -419,7 +467,7 @@ async def get_hkgolden_thread_content(thread_id, cat_id=None, request_counter=0,
     result = {
         "replies": replies,
         "title": thread_title,
-        "total_replies": total_replies,
+        "tr": total_replies,
         "rate_limit_info": rate_limit_info,
         "request_counter": request_counter,
         "last_reset": last_reset,

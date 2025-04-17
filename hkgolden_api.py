@@ -170,7 +170,6 @@ async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, req
                         data_content = data.get("data", {})
                         logger.debug(f"API response for cat_id={cat_id}, page={page}: status={status}, data={data_content}")
                         
-                        # 動態調整 max_pages
                         if isinstance(data_content, dict) and "maxPage" in data_content:
                             max_pages = min(max_pages, data_content["maxPage"], 10)
                             fetch_conditions["max_pages"] = max_pages
@@ -200,9 +199,10 @@ async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, req
                                 standardized_items.append({
                                     "id": item["id"],
                                     "title": item.get("title", "Unknown title"),
-                                    "nor": item.get("totalReplies", 0),
-                                    "lrt": item.get("lastReplyDate", 0) / 1000,  # 毫秒轉秒
-                                    "rt": item.get("marksGood", 0) - item.get("marksBad", 0)
+                                    "no_of_reply": item.get("totalReplies", 0),
+                                    "last_reply_time": item.get("lastReplyDate", 0) / 1000,  # 毫秒轉秒
+                                    "like_count": item.get("marksGood", 0),
+                                    "dislike_count": item.get("marksBad", 0)
                                 })
                             except (TypeError, KeyError) as e:
                                 data_structure_errors.append(
@@ -213,7 +213,6 @@ async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, req
                                 )
                                 continue
                         
-                        # 直接使用 standardized_items，移除篩選
                         items.extend(standardized_items)
                         break
                     
@@ -227,11 +226,9 @@ async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, req
                     await asyncio.sleep(1)
                     break
             
-            # 動態延遲
             delay = HKGOLDEN_API["REQUEST_DELAY"] * (1 + total_requests / 20)
             await asyncio.sleep(delay)
     
-    # 總結日誌
     elapsed_time = time.time() - start_time
     logger.info(f"Processed {len(items)} threads, total requests={total_requests}, time={elapsed_time:.2f}s")
     
@@ -249,192 +246,4 @@ async def get_hkgolden_thread_content(thread_id, cat_id=None, request_counter=0,
     if cache_key in st.session_state.thread_content_cache:
         cache_data = st.session_state.thread_content_cache[cache_key]
         if time.time() - cache_data["timestamp"] < HKGOLDEN_API["CACHE_DURATION"]:
-            logger.info(f"Cache hit for id={thread_id}, replies={len(cache_data['data']['replies'])}")
-            return cache_data["data"]
-    
-    device_id = hashlib.sha1(str(uuid.uuid4()).encode()).hexdigest()
-    headers = {
-        "User-Agent": random.choice(USER_AGENTS),
-        "X-DEVICE-ID": device_id,
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "zh-HK,zh-Hant;q=0.9,en;q=0.8",
-        "Connection": "keep-alive",
-        "Referer": f"{HKGOLDEN_API['BASE_URL']}/view/{thread_id}",
-        "hkgauth": "null"
-    }
-    
-    replies = []
-    page = 1
-    thread_title = None
-    total_replies = None
-    rate_limit_info = []
-    max_retries = 3
-    request_counter_increment = 0
-    pages_fetched = []
-    start_time = time.time()
-    
-    current_time = time.time()
-    if current_time < rate_limit_until:
-        rate_limit_info.append(
-            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} - API rate limit active, retry after {datetime.fromtimestamp(rate_limit_until)}"
-        )
-        logger.warning(f"API rate limit active, waiting until {datetime.fromtimestamp(rate_limit_until)}")
-        return {
-            "replies": replies,
-            "title": thread_title,
-            "tr": total_replies,
-            "rate_limit_info": rate_limit_info,
-            "request_counter": request_counter,
-            "request_counter_increment": request_counter_increment,
-            "last_reset": last_reset,
-            "rate_limit_until": rate_limit_until
-        }
-    
-    async with aiohttp.ClientSession() as session:
-        logger.debug(f"Fetching id={thread_id}, pages=1-all")
-        while True:
-            if current_time - last_reset >= 60:
-                request_counter = 0
-                last_reset = current_time
-            
-            api_key = get_api_topic_details_key(thread_id, page)
-            params = {
-                "s": api_key,
-                "message": str(thread_id),
-                "page": str(page),
-                "user_id": "0",
-                "sensormode": "Y",
-                "hideblock": "N",
-                "returntype": "json"
-            }
-            url = f"{HKGOLDEN_API['BASE_URL']}/v1/view/{thread_id}/{page}"
-            
-            fetch_conditions = {
-                "thread_id": thread_id,
-                "page": page,
-                "request_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-            }
-            
-            for attempt in range(max_retries):
-                try:
-                    await rate_limiter.acquire(context=fetch_conditions)
-                    request_counter += 1
-                    request_counter_increment += 1
-                    async with session.get(url, headers=headers, params=params, timeout=10) as response:
-                        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                        if response.status == 429:
-                            retry_after = response.headers.get("Retry-After", "5")
-                            wait_time = int(retry_after) if retry_after.isdigit() else 5
-                            wait_time = min(wait_time * (2 ** attempt), 60) + random.uniform(0, 0.1)
-                            rate_limit_until = time.time() + wait_time
-                            rate_limit_info.append(
-                                f"{current_time} - Server rate limit: id={thread_id}, page={page}, "
-                                f"status=429, attempt {attempt+1}, waiting {wait_time:.2f} seconds"
-                            )
-                            logger.warning(
-                                f"Server rate limit: id={thread_id}, page={page}, status=429, "
-                                f"waiting {wait_time:.2f} seconds"
-                            )
-                            await asyncio.sleep(wait_time)
-                            continue
-                        
-                        if response.status != 200:
-                            rate_limit_info.append(
-                                f"{current_time} - Fetch thread content failed: id={thread_id}, page={page}, status={response.status}"
-                            )
-                            logger.error(
-                                f"Fetch thread content failed: id={thread_id}, page={page}, status={response.status}, url={url}"
-                            )
-                            try:
-                                error_data = await response.text()
-                                logger.error(f"API error response: {error_data[:200]}")
-                            except Exception as e:
-                                logger.error(f"Failed to read error response: {str(e)}")
-                            await asyncio.sleep(1)
-                            break
-                        
-                        data = await response.json()
-                        if not data.get("result", True):
-                            error_message = data.get("error_message", "Unknown error")
-                            rate_limit_info.append(
-                                f"{current_time} - API returned failure: id={thread_id}, page={page}, error={error_message}"
-                            )
-                            logger.error(
-                                f"API returned failure: id={thread_id}, page={page}, error={error_message}"
-                            )
-                            await asyncio.sleep(1)
-                            break
-                        
-                        thread_data = data.get("data", {})
-                        logger.debug(f"Thread response for id={thread_id}, page={page}: data={thread_data}")
-                        if page == 1:
-                            thread_title = thread_data.get("title", "Unknown title")
-                            total_replies = thread_data.get("totalReplies", None)
-                        
-                        new_replies = thread_data.get("replies", [])
-                        if not new_replies and page > 1:
-                            break
-                        
-                        standardized_replies = [
-                            {
-                                "msg": reply.get("content", ""),
-                                "like_count": reply.get("like_count", 0),
-                                "dislike_count": reply.get("dislike_count", 0)
-                            }
-                            for reply in new_replies if reply.get("content", "").strip()
-                        ]
-                        
-                        replies.extend(standardized_replies)
-                        pages_fetched.append(page)
-                        page += 1
-                        
-                        if len(replies) >= max_replies:
-                            break
-                        break
-                    
-                except Exception as e:
-                    rate_limit_info.append(
-                        f"{current_time} - Fetch thread content error: id={thread_id}, page={page}, error={str(e)}"
-                    )
-                    logger.error(
-                        f"Fetch thread content error: id={thread_id}, page={page}, error={str(e)}, url={url}"
-                    )
-                    await asyncio.sleep(1)
-                    break
-            
-            delay = HKGOLDEN_API["REQUEST_DELAY"] * (1 + request_counter_increment / 20)
-            await asyncio.sleep(delay)
-            current_time = time.time()
-            
-            if total_replies and len(replies) >= total_replies:
-                break
-            if len(replies) >= max_replies:
-                break
-        
-        if total_replies is None:
-            total_replies = len(replies)
-            logger.warning(f"Missing totalReplies for id={thread_id}, using len(replies)={total_replies}")
-        
-        pages_str = f"1-{max(pages_fetched)}" if pages_fetched else "none"
-        empty_replies = len(new_replies) - len(standardized_replies) if new_replies else 0
-        logger.info(
-            f"Fetched {len(replies)} replies for id={thread_id}, pages={pages_str}, tr={total_replies}, requests={request_counter_increment}, empty_replies={empty_replies}"
-        )
-    
-    result = {
-        "replies": replies[:max_replies],
-        "title": thread_title,
-        "tr": total_replies,
-        "rate_limit_info": rate_limit_info,
-        "request_counter": request_counter,
-        "request_counter_increment": request_counter_increment,
-        "last_reset": last_reset,
-        "rate_limit_until": rate_limit_until
-    }
-    
-    st.session_state.thread_content_cache[cache_key] = {
-        "data": result,
-        "timestamp": time.time()
-    }
-    
-    return result
+            logger.info(f"Cache hit for id={thread_id}, replies={len(cache_dat

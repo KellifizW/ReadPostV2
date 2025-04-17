@@ -55,7 +55,12 @@ async def chat_page():
                 st.markdown("**提示預覽**：")
                 st.code(chat['response'], language="text")
             else:
-                st.markdown(f"**回應**：{chat['response']}")
+                # 分離分享文字和選擇理由
+                response_lines = chat['response'].split('\n')
+                share_text = response_lines[0].replace('分享文字：', '').strip() if response_lines else chat['response']
+                reason = response_lines[1].replace('選擇理由：', '').strip() if len(response_lines) > 1 else '無選擇理由'
+                st.markdown(f"**分享文字**：{share_text}")
+                st.markdown(f"**選擇理由**：{reason}")
             if chat.get("debug_info") or chat.get("analysis"):
                 with st.expander("調試信息"):
                     if chat.get("analysis"):
@@ -241,7 +246,12 @@ async def chat_page():
                     return
             
             response = result.get("response", "無回應內容")
-            placeholder.markdown(response)
+            # 分離分享文字和選擇理由
+            response_lines = response.split('\n')
+            share_text = response_lines[0].replace('分享文字：', '').strip() if response_lines else response
+            reason = response_lines[1].replace('選擇理由：', '').strip() if len(response_lines) > 1 else '無選擇理由'
+            placeholder.markdown(f"**分享文字**：{share_text}")
+            placeholder.markdown(f"**選擇理由**：{reason}")
             
             if result.get("rate_limit_info"):
                 debug_info.append("#### 調試信息：")

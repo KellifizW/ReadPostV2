@@ -61,10 +61,12 @@ def filter_items(items, current_time_ms):
         try:
             # 篩選條件
             is_active = item["nor"] >= 10  # 回覆數 >= 10
-            is_quality = item["rt"] >= 3  # 評分 >= 3
+            is_quality = item["rt"] >= 3   # 評分 >= 3
             is_recent = item["lrt"] * 1000 >= (current_time_ms - 24 * 3600 * 1000)  # 最近 24 小時
             if is_active and is_quality and is_recent:
                 filtered_items.append(item)
+            else:
+                logger.debug(f"Filtered out: id={item['id']}, nor={item['nor']}, rt={item['rt']}, lrt={item['lrt']}")
         except (KeyError, TypeError) as e:
             logger.error(f"Filter error: item={item}, error={str(e)}")
             continue
@@ -117,17 +119,11 @@ async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, req
             
             fetch_conditions = {
                 "cat_id": cat_id,
-                "sub_cat_id": sub_cat_id,
                 "page": page,
-                "max_pages": max_pages,
-                "user_agent": headers["User-Agent"],
-                "device_id": device_id,
-                "request_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
-                "request_counter": request_counter,
-                "last_reset": datetime.fromtimestamp(last_reset).strftime("%Y-%m-%d %H:%M:%S"),
-                "rate_limit_until": datetime.fromtimestamp(rate_limit_until).strftime("%Y-%m-%d %H:%M:%S") if rate_limit_until > time.time() else "None"
+                "request_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
             }
             
+            logger.info(f"Fetching cat_id={cat_id}, page={page}")
             for attempt in range(max_retries):
                 try:
                     await rate_limiter.acquire(context=fetch_conditions)
@@ -141,12 +137,11 @@ async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, req
                             rate_limit_until = time.time() + wait_time
                             rate_limit_info.append(
                                 f"{current_time} - Server rate limit: cat_id={cat_id}, page={page}, "
-                                f"status=429, attempt {attempt+1}, waiting {wait_time:.2f} seconds, "
-                                f"Retry-After={retry_after}, request_count={request_counter}"
+                                f"status=429, attempt {attempt+1}, waiting {wait_time:.2f} seconds"
                             )
                             logger.warning(
                                 f"Server rate limit: cat_id={cat_id}, page={page}, status=429, "
-                                f"waiting {wait_time:.2f} seconds, Retry-After={retry_after}"
+                                f"waiting {wait_time:.2f} seconds"
                             )
                             await asyncio.sleep(wait_time)
                             continue
@@ -156,7 +151,7 @@ async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, req
                                 f"{current_time} - Fetch failed: cat_id={cat_id}, page={page}, status={response.status}"
                             )
                             logger.error(
-                                f"Fetch failed: cat_id={cat_id}, page={page}, status={response.status}, conditions={fetch_conditions}"
+                                f"Fetch failed: cat_id={cat_id}, page={page}, status={response.status}"
                             )
                             await asyncio.sleep(1)
                             break
@@ -168,77 +163,49 @@ async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, req
                                 f"{current_time} - Invalid JSON response: cat_id={cat_id}, page={page}, content_type={response.content_type}"
                             )
                             logger.error(
-                                f"Invalid JSON response: cat_id={cat_id}, page={page}, content_type={response.content_type}, conditions={fetch_conditions}"
+                                f"Invalid JSON response: cat_id={cat_id}, page={page}, content_type={response.content_type}"
                             )
                             break
                         
-                        logger.info(f"Raw response for cat_id={cat_id}, page={page}: {data}")  # 記錄原始響應
                         if not data.get("result", True):
                             error_message = data.get("error_message", "Unknown error")
                             rate_limit_info.append(
                                 f"{current_time} - API returned failure: cat_id={cat_id}, page={page}, error={error_message}"
                             )
                             logger.error(
-                                f"API returned failure: cat_id={cat_id}, page={page}, error={error_message}, conditions={fetch_conditions}"
+                                f"API returned failure: cat_id={cat_id}, page={page}, error={error_message}"
                             )
                             await asyncio.sleep(1)
                             break
                         
                         # 提取帖子列表
                         data_content = data.get("data", {})
-                        logger.info(f"Data content for cat_id={cat_id}, page={page}: type={type(data_content)}, keys={list(data_content.keys()) if isinstance(data_content, dict) else []}")  # 記錄類型和鍵
+                        logger.debug(f"Data content for cat_id={cat_id}, page={page}: type={type(data_content)}, keys={list(data_content.keys()) if isinstance(data_content, dict) else []}")
                         
                         # 動態調整 max_pages
                         if isinstance(data_content, dict) and "maxPage" in data_content:
-                            max_pages = min(max_pages, data_content["maxPage"], 10)  # 限制最大 10 頁
+                            max_pages = min(max_pages, data_content["maxPage"], 10)
                             fetch_conditions["max_pages"] = max_pages
                         
-                        new_items = data_content.get("list", [])  # 優先使用 data["data"]["list"]
-                        
-                        # 兼容其他可能的結構
-                        if not new_items and isinstance(data_content, dict):
-                            new_items = (
-                                data_content.get("items", []) or
-                                data_content.get("threads", []) or
-                                data_content.get("topics", []) or
-                                []
-                            )
-                        elif isinstance(data.get("data"), list):
-                            new_items = data.get("data", [])  # 兼容舊結構
-                        elif isinstance(data.get("data"), str):
+                        new_items = data_content.get("list", [])
+                        if not new_items:
                             data_structure_errors.append(
-                                f"{current_time} - Data is a string: cat_id={cat_id}, page={page}, data={data['data'][:500]}"
+                                f"{current_time} - Empty list: cat_id={cat_id}, page={page}"
                             )
                             logger.error(
-                                f"Data is a string: cat_id={cat_id}, page={page}, data={data['data'][:500]}, conditions={fetch_conditions}"
-                            )
-                            break
-                        elif data.get("data") is None:
-                            data_structure_errors.append(
-                                f"{current_time} - Data is None: cat_id={cat_id}, page={page}"
-                            )
-                            logger.error(
-                                f"Data is None: cat_id={cat_id}, page={page}, conditions={fetch_conditions}"
-                            )
-                            break
-                        else:
-                            data_structure_errors.append(
-                                f"{current_time} - Invalid data structure: cat_id={cat_id}, page={page}, data_type={type(data['data'])}, data={str(data['data'])[:500]}"
-                            )
-                            logger.error(
-                                f"Invalid data structure: cat_id={cat_id}, page={page}, data_type={type(data['data'])}, data={str(data['data'])[:500]}, conditions={fetch_conditions}"
+                                f"Empty list: cat_id={cat_id}, page={page}"
                             )
                             break
                         
-                        logger.info(f"Extracted items for cat_id={cat_id}, page={page}: {len(new_items)} items")  # 記錄提取的項目數
+                        logger.info(f"Fetched {len(new_items)} items for cat_id={cat_id}, page={page}")
                         standardized_items = []
                         for item in new_items:
                             if not isinstance(item, dict):
                                 data_structure_errors.append(
-                                    f"{current_time} - Invalid item type: cat_id={cat_id}, page={page}, item={str(item)[:500]}, type={type(item)}"
+                                    f"{current_time} - Invalid item type: cat_id={cat_id}, page={page}, type={type(item)}"
                                 )
                                 logger.error(
-                                    f"Invalid item type: cat_id={cat_id}, page={page}, item={str(item)[:500]}, type={type(item)}, conditions={fetch_conditions}"
+                                    f"Invalid item type: cat_id={cat_id}, page={page}, type={type(item)}"
                                 )
                                 continue
                             try:
@@ -251,19 +218,15 @@ async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, req
                                 })
                             except (TypeError, KeyError) as e:
                                 data_structure_errors.append(
-                                    f"{current_time} - Item parsing error: cat_id={cat_id}, page={page}, item={str(item)[:500]}, error={str(e)}"
+                                    f"{current_time} - Item parsing error: cat_id={cat_id}, page={page}, error={str(e)}"
                                 )
                                 logger.error(
-                                    f"Item parsing error: cat_id={cat_id}, page={page}, item={str(item)[:500]}, error={str(e)}, conditions={fetch_conditions}"
+                                    f"Item parsing error: cat_id={cat_id}, page={page}, error={str(e)}"
                                 )
                                 continue
                         
                         # 篩選帖子
                         filtered_items = filter_items(standardized_items, current_time_ms)
-                        logger.info(
-                            f"Fetch successful: cat_id={cat_id}, page={page}, items={len(new_items)}, "
-                            f"standardized_items={len(standardized_items)}, filtered_items={len(filtered_items)}, conditions={fetch_conditions}"
-                        )
                         
                         # 獲取 total_replies
                         for item in filtered_items:
@@ -274,7 +237,7 @@ async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, req
                                 last_reset=last_reset,
                                 rate_limit_until=rate_limit_until
                             )
-                            item["tr"] = thread_data.get("tr", item["nor"])  # 默認使用 nor
+                            item["tr"] = thread_data.get("tr", item["nor"])
                             request_counter = thread_data.get("request_counter", request_counter)
                             last_reset = thread_data.get("last_reset", last_reset)
                             rate_limit_until = thread_data.get("rate_limit_until", rate_limit_until)
@@ -288,7 +251,7 @@ async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, req
                         f"{current_time} - Fetch error: cat_id={cat_id}, page={page}, error={str(e)}"
                     )
                     logger.error(
-                        f"Fetch error: cat_id={cat_id}, page={page}, error={str(e)}, conditions={fetch_conditions}"
+                        f"Fetch error: cat_id={cat_id}, page={page}, error={str(e)}"
                     )
                     await asyncio.sleep(1)
                     break
@@ -334,8 +297,7 @@ async def get_hkgolden_thread_content(thread_id, cat_id=None, request_counter=0,
     current_time = time.time()
     if current_time < rate_limit_until:
         rate_limit_info.append(
-            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} - API rate limit active, "
-            f"retry after {datetime.fromtimestamp(rate_limit_until)}"
+            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} - API rate limit active, retry after {datetime.fromtimestamp(rate_limit_until)}"
         )
         logger.warning(f"API rate limit active, waiting until {datetime.fromtimestamp(rate_limit_until)}")
         return {
@@ -368,16 +330,11 @@ async def get_hkgolden_thread_content(thread_id, cat_id=None, request_counter=0,
             
             fetch_conditions = {
                 "thread_id": thread_id,
-                "cat_id": cat_id if cat_id else "None",
                 "page": page,
-                "user_agent": headers["User-Agent"],
-                "device_id": device_id,
-                "request_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
-                "request_counter": request_counter,
-                "last_reset": datetime.fromtimestamp(last_reset).strftime("%Y-%m-%d %H:%M:%S"),
-                "rate_limit_until": datetime.fromtimestamp(rate_limit_until).strftime("%Y-%m-%d %H:%M:%S") if rate_limit_until > time.time() else "None"
+                "request_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
             }
             
+            logger.info(f"Fetching thread_id={thread_id}, page={page}")
             for attempt in range(max_retries):
                 try:
                     await rate_limiter.acquire(context=fetch_conditions)
@@ -391,12 +348,11 @@ async def get_hkgolden_thread_content(thread_id, cat_id=None, request_counter=0,
                             rate_limit_until = time.time() + wait_time
                             rate_limit_info.append(
                                 f"{current_time} - Server rate limit: thread_id={thread_id}, page={page}, "
-                                f"status=429, attempt {attempt+1}, waiting {wait_time:.2f} seconds, "
-                                f"Retry-After={retry_after}, request_count={request_counter}"
+                                f"status=429, attempt {attempt+1}, waiting {wait_time:.2f} seconds"
                             )
                             logger.warning(
                                 f"Server rate limit: thread_id={thread_id}, page={page}, status=429, "
-                                f"waiting {wait_time:.2f} seconds, Retry-After={retry_after}"
+                                f"waiting {wait_time:.2f} seconds"
                             )
                             await asyncio.sleep(wait_time)
                             continue
@@ -406,7 +362,7 @@ async def get_hkgolden_thread_content(thread_id, cat_id=None, request_counter=0,
                                 f"{current_time} - Fetch thread content failed: thread_id={thread_id}, page={page}, status={response.status}"
                             )
                             logger.error(
-                                f"Fetch thread content failed: thread_id={thread_id}, page={page}, status={response.status}, conditions={fetch_conditions}"
+                                f"Fetch thread content failed: thread_id={thread_id}, page={page}, status={response.status}"
                             )
                             await asyncio.sleep(1)
                             break
@@ -418,7 +374,7 @@ async def get_hkgolden_thread_content(thread_id, cat_id=None, request_counter=0,
                                 f"{current_time} - API returned failure: thread_id={thread_id}, page={page}, error={error_message}"
                             )
                             logger.error(
-                                f"API returned failure: thread_id={thread_id}, page={page}, error={error_message}, conditions={fetch_conditions}"
+                                f"API returned failure: thread_id={thread_id}, page={page}, error={error_message}"
                             )
                             await asyncio.sleep(1)
                             break
@@ -440,8 +396,7 @@ async def get_hkgolden_thread_content(thread_id, cat_id=None, request_counter=0,
                         ]
                         
                         logger.info(
-                            f"Fetch thread replies successful: thread_id={thread_id}, page={page}, "
-                            f"replies={len(new_replies)}, conditions={fetch_conditions}"
+                            f"Fetched {len(new_replies)} replies for thread_id={thread_id}, page={page}"
                         )
                         
                         replies.extend(standardized_replies)
@@ -453,7 +408,7 @@ async def get_hkgolden_thread_content(thread_id, cat_id=None, request_counter=0,
                         f"{current_time} - Fetch thread content error: thread_id={thread_id}, page={page}, error={str(e)}"
                     )
                     logger.error(
-                        f"Fetch thread content error: thread_id={thread_id}, page={page}, error={str(e)}, conditions={fetch_conditions}"
+                        f"Fetch thread content error: thread_id={thread_id}, page={page}, error={str(e)}"
                     )
                     await asyncio.sleep(1)
                     break

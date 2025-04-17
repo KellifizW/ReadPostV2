@@ -39,3 +39,11 @@ HKGOLDEN_API = {
     "RATE_LIMIT_DURATION": 3600,
     "RATE_LIMIT_RESET": 3600
 }
+
+GROK3_API = {
+    "BASE_URL": "https://api.x.ai/grok3",
+    "API_KEY": "your_api_key_here",  # 替換為實際的 API 密鑰
+    "TIMEOUT": 300,  # 請求超時（秒）
+    "MAX_RETRIES": 3,  # 最大重試次數
+    "USER_AGENT": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+}

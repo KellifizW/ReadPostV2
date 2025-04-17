@@ -13,11 +13,12 @@ from grok3_client import call_grok3_api
 import re
 from threading import Lock
 import aiohttp
+import json
 
 logger = streamlit.logger.get_logger(__name__)
 processing_lock = Lock()
 active_requests = {}
-MAX_PROMPT_LENGTH = 30000
+MAX_PROMPT_LENGTH = 10000
 THREAD_ID_CACHE_DURATION = 300
 HONG_KONG_TZ = pytz.timezone("Asia/Hong_Kong")
 
@@ -80,7 +81,6 @@ async def analyze_user_question(question, platform):
     reply_strategy = "無需抓取回覆內容"
     filter_condition = "none"
     
-    # 直接解析 API 回應，確保保留原始結果
     for line in content.split("\n"):
         line = line.strip()
         if line.startswith("意圖:"):
@@ -97,17 +97,15 @@ async def analyze_user_question(question, platform):
         elif line.startswith("篩選條件:"):
             filter_condition = line.replace("篩選條件:", "").strip()
     
-    # 針對「on9」問題的特殊處理
     if "on9" in question.lower():
         intent = "尋找on9帖子"
         data_types = ["title", "no_of_reply", "last_reply_time", "like_count", "dislike_count", "replies"]
         num_threads = 5
-        reply_strategy = "最新50條"
-        filter_condition = "按回覆數量排序，優先選擇今日發布的帖子，標題或回覆包含‘on9’或搞笑、荒謬相關內容"
+        reply_strategy = "最新20條"
+        filter_condition = "按回覆數量排序，標題或回覆包含‘on9’或搞笑、荒謬、惡搞、迷因相關內容，優先今日帖子但允許最近三天"
     
-    # 確保「今日」問題優先今日帖子
     if "今日" in question.lower():
-        filter_condition = f"{filter_condition}; 優先選擇今日發布的帖子"
+        filter_condition = f"{filter_condition}; 優先選擇今日發布的帖子，若無則放寬至最近三天"
     
     return {
         "intent": intent,
@@ -170,7 +168,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
     st.session_state.last_reset = result["last_reset"]
     st.session_state.rate_limit_until = result["rate_limit_until"]
     
-    logger.info(f"Fetch completed: platform={platform}, category={selected_cat}, total_items={len(items)}, elapsed={time.time() - start_fetch_time:.2f}s")
+    logger.info(f"Fetch completed: platform={platform}, CATEGORY={selected_cat}, total_items={len(items)}, elapsed={time.time() - start_fetch_time:.2f}s")
     
     if not items:
         logger.error("No items fetched from API")
@@ -187,8 +185,8 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
     selected_items = []
     filter_condition = analysis["filter_condition"].lower()
     today = datetime.now(HONG_KONG_TZ).date()
+    three_days_ago = today - timedelta(days=3)
     
-    # 篩選今日帖子並按回覆數排序
     filtered_items = []
     for item in items:
         create_time = item.get("create_time", 0)
@@ -197,11 +195,11 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
         title = item.get("title", "").lower()
         if last_reply_time and no_of_reply > 0:
             create_date = datetime.fromtimestamp(create_time, tz=HONG_KONG_TZ).date() if create_time else None
-            # 檢查是否今日帖子
-            if "今日" in filter_condition and create_date != today:
+            # 放寬至最近三天
+            if "優先選擇今日發布的帖子" in filter_condition and create_date < three_days_ago:
                 continue
-            # 檢查「on9」相關內容
-            if "on9" in filter_condition and ("on9" in title or any(kw in title for kw in ["搞笑", "荒謬", "無語", "惡搞"])):
+            # 檢查「On9」相關內容（標題）
+            if "on9" in filter_condition and ("on9" in title or any(kw in title for kw in ["搞笑", "荒謬", "無語", "惡搞", "迷因", "搞亂"])):
                 filtered_items.append(item)
             else:
                 filtered_items.append(item)
@@ -235,7 +233,6 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
     processed_data = []
     threads_data = []
     
-    # 根據回覆策略抓取回覆
     for selected_item in selected_items:
         try:
             thread_id = selected_item["thread_id"] if platform == "LIHKG" else selected_item["id"]
@@ -260,7 +257,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
                 total_replies = thread_data["total_replies"]
                 rate_limit_info.extend(thread_data.get("rate_limit_info", []))
             else:
-                thread_max_replies = min(no_of_reply, 50) if "最新50條" in analysis["reply_strategy"] else no_of_reply
+                thread_max_replies = min(no_of_reply, 20) if "最新20條" in analysis["reply_strategy"] else no_of_reply
                 logger.info(f"Fetching thread content: thread_id={thread_id}, platform={platform}, max_replies={thread_max_replies}")
                 
                 if platform == "LIHKG":
@@ -294,7 +291,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
                 valid_replies = []
                 for reply in replies:
                     cleaned_text = clean_reply_text(reply["msg"])
-                    if cleaned_text:
+                    if cleaned_text and any(kw in cleaned_text.lower() for kw in ["on9", "搞笑", "荒謬", "無語", "惡搞", "迷因", "搞亂"]):
                         valid_replies.append({"content": cleaned_text})
                 
                 thread_data = {
@@ -363,7 +360,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
 - 負評數：{thread['dislike_count']}
 """
         if thread["replies"]:
-            prompt += f"- 回覆（共 {len(thread['replies'])} 條，篩選後忽略 ≤ 5 個字的回覆）：\n"
+            prompt += f"- 回覆（共 {len(thread['replies'])} 條，篩選後僅保留含‘On9’或搞笑相關內容）：\n"
             max_replies = len(thread["replies"])
             reply_count = 0
             for reply in thread["replies"]:
@@ -380,8 +377,8 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
     
     prompt += f"""
 請完成以下任務：
-1. 生成一段簡潔的分享或排列文字，嚴格限制在 {share_text_limit} 字以內，列出 {analysis['num_threads']} 個帖子，按回覆數量降序排列，包含每個帖子的標題、回覆數量、最後回覆時間、點讚數和負評數。針對「on9」問題，總結每個帖子的「on9」特質（例如搞笑、荒謬、爭議性內容），基於回覆內容分析主要觀點、情緒或熱門話題。
-2. 提供一段簡短的選擇理由（{reason_limit} 字以內），解釋為何選擇這些帖子（例如話題性、符合「on9」特質、今日熱度等）。
+1. 生成一段簡潔的分享或排列文字，嚴格限制在 {share_text_limit} 字以內，列出 {analysis['num_threads']} 個帖子，按回覆數量降序排列，包含每個帖子的標題、回覆數量、最後回覆時間、點讚數和負評數。針對「On9」問題，總結每個帖子的「On9」特質（例如搞笑、荒謬、爭議性內容），基於回覆內容分析主要觀點、情緒或熱門話題。
+2. 提供一段簡短的選擇理由（{reason_limit} 字以內），解釋為何選擇這些帖子（例如話題性、符合「On9」特質、近期熱度等）。
 3. 若回覆數量過多，根據回覆策略（{analysis['reply_strategy']}）優先總結最新或最相關的回覆內容。
 
 回應格式：
@@ -436,7 +433,6 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
             if reason_match:
                 reason = reason_match.group(1).strip()
             
-            # 模擬流式效果，逐塊顯示
             full_text = f"{share_text}\n\n{reason}" if reason else share_text
             for i in range(0, len(full_text), 50):
                 yield full_text[i:i+50] + "\n"
@@ -447,13 +443,26 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
         async for chunk in api_result["content"]:
             if chunk:
                 logger.debug(f"Received chunk: {chunk[:50]}...")
-                buffer += chunk
-                # 每累積 10-50 字或檢測到換行，yield 一塊
+                try:
+                    # 解析 xAI 流式 JSON
+                    if chunk.strip() == "data: [DONE]":
+                        break
+                    if chunk.strip().startswith("data:"):
+                        json_data = json.loads(chunk.strip().replace("data: ", ""))
+                        if "choices" in json_data and json_data["choices"]:
+                            content = json_data["choices"][0].get("delta", {}).get("content", "")
+                            if content:
+                                buffer += content
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Failed to parse JSON chunk: {chunk}, error={str(e)}")
+                    continue
+                
+                # 每 10-50 字或換行 yield 一塊
                 while "\n" in buffer or len(buffer) >= 50:
                     if "\n" in buffer:
                         line, buffer = buffer.split("\n", 1)
                         yield line + "\n"
-                        await asyncio.sleep(0.05)  # 模擬打字機效果
+                        await asyncio.sleep(0.05)
                     else:
                         yield buffer[:50] + "\n"
                         buffer = buffer[50:]
@@ -463,7 +472,6 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
                     buffer = ""
                     await asyncio.sleep(0.05)
         
-        # 處理剩餘 buffer
         if buffer:
             yield buffer + "\n"
     

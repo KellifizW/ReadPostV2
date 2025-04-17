@@ -3,7 +3,7 @@ import asyncio
 from datetime import datetime
 import pytz
 from data_processor import process_user_question
-from grok3_client import call_grok3_api
+from grok3_client import stream_grok3_response
 import time
 from config import LIHKG_API, HKGOLDEN_API, GENERAL
 import streamlit.logger
@@ -41,14 +41,6 @@ async def chat_page():
     
     selected_cat = st.selectbox("選擇分類", options=list(categories.keys()), index=0)
     
-    # 添加最少回覆數量選擇框
-    min_replies = st.selectbox(
-        "選擇最少回覆數量",
-        options=[10, 20, 30, 50],
-        index=1,  # 預設為 20
-        help="選擇帖子必須具備的最少回覆數量。降低此值可能獲得更多結果。"
-    )
-    
     st.markdown("### 聊天記錄")
     for chat in st.session_state.chat_history:
         with st.chat_message("user"):
@@ -60,10 +52,10 @@ async def chat_page():
                     for info in chat["debug_info"]:
                         st.markdown(info)
     
-    user_input = st.chat_input("輸入你的問題或要求（例如：分享一個有趣的帖文）")
+    user_input = st.chat_input("輸入你的問題或要求（例如：分享任何帖文）")
     
     if user_input:
-        submit_key = f"{user_input}:{platform}:{selected_cat}:{min_replies}"
+        submit_key = f"{user_input}:{platform}:{selected_cat}"
         current_time = time.time()
         if (st.session_state.last_submit_key == submit_key and 
             current_time - st.session_state.last_submit_time < 5):
@@ -78,23 +70,22 @@ async def chat_page():
             placeholder = st.empty()
             debug_info = []
             
-            cache_key = f"{platform}_{selected_cat}_{user_input}_{min_replies}"
+            cache_key = f"{platform}_{selected_cat}_{user_input}"
             use_cache = cache_key in st.session_state.thread_content_cache and \
                         time.time() - st.session_state.thread_content_cache[cache_key]["timestamp"] < \
                         (LIHKG_API["CACHE_DURATION"] if platform == "LIHKG" else HKGOLDEN_API["CACHE_DURATION"])
             
             if use_cache:
-                logger.info(f"Using cache: platform={platform}, category={selected_cat}, question={user_input}, min_replies={min_replies}")
+                logger.info(f"Using cache: platform={platform}, category={selected_cat}, question={user_input}")
                 result = st.session_state.thread_content_cache[cache_key]["data"]
             else:
                 try:
-                    logger.info(f"Starting to process question: question={user_input}, platform={platform}, category={selected_cat}, min_replies={min_replies}")
+                    logger.info(f"Starting to process question: question={user_input}, platform={platform}, category={selected_cat}")
                     result = await process_user_question(
                         user_input,
                         platform=platform,
                         cat_id_map=categories,
-                        selected_cat=selected_cat,
-                        min_replies=min_replies  # 傳遞用戶選擇的最少回覆數量
+                        selected_cat=selected_cat
                     )
                     st.session_state.thread_content_cache[cache_key] = {
                         "data": result,
@@ -102,18 +93,18 @@ async def chat_page():
                     }
                 except Exception as e:
                     result = {}
-                    debug_info = [f"#### 調試信息：\n- 處理錯誤: 原因={repr(e)}"]
+                    debug_info = [f"#### 調試信息：\n- 處理錯誤: 原因={str(e)}"]
                     if result.get("rate_limit_info"):
                         debug_info.append("- 速率限制或錯誤記錄：")
                         debug_info.extend(f"  - {info}" for info in result["rate_limit_info"])
-                    error_message = f"處理失敗，原因：{repr(e)}。請嘗試降低最少回覆數量或更改分類。"
+                    error_message = f"處理失敗，原因：{str(e)}。請稍後重試或檢查 API 配置。"
                     placeholder.markdown(error_message)
                     st.session_state.chat_history.append({
                         "question": user_input,
                         "response": error_message,
                         "debug_info": debug_info
                     })
-                    logger.error(f"Processing failed: question={user_input}, platform={platform}, error={repr(e)}")
+                    logger.error(f"Processing failed: question={user_input}, platform={platform}, error={str(e)}")
                     return
             
             response = result.get("response", "無回應內容")

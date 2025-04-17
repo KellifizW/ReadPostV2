@@ -73,7 +73,7 @@ async def chat_page():
                     if reason != "無選擇理由":
                         st.markdown(f"**選擇理由**：{reason}")
                 else:
-                    st.write_stream(response)
+                    st.write(response)
             
             if chat.get("debug_info") or chat.get("analysis"):
                 with st.expander("調試信息"):
@@ -256,25 +256,31 @@ async def chat_page():
                     
                     if share_match:
                         share_text = share_match.group(1).strip()
-                        placeholder.markdown(f"**分享文字**：{share_text}")
                     if reason_match:
                         reason = reason_match.group(1).strip()
+                    
+                    if share_text != "無分享文字":
+                        placeholder.markdown(f"**分享文字**：{share_text}")
+                    if reason != "無選擇理由":
                         placeholder.markdown(f"**選擇理由**：{reason}")
                 else:
-                    placeholder.write_stream(response)
+                    # 改進 st.write_stream，收集所有塊並處理錯誤
+                    full_response = []
+                    try:
+                        for chunk in st.write_stream(response):
+                            full_response.append(chunk)
+                        response_text = "".join(full_response)
+                        placeholder.markdown(response_text)
+                    except Exception as e:
+                        debug_info.append(f"#### 調試信息：\n- 流式處理錯誤: 原因={str(e)}")
+                        error_message = f"無法顯示回應，API 連接失敗：{str(e)}。請稍後重試。"
+                        placeholder.markdown(error_message)
+                        response_text = error_message
             except Exception as e:
-                debug_info = [f"#### 調試信息：\n- 流式處理錯誤: 原因={str(e)}"]
-                error_message = f"無法顯示回應，API 連接失敗：{str(e)}。請稍後重試。"
+                debug_info.append(f"#### 調試信息：\n- 處理錯誤: 原因={str(e)}")
+                error_message = f"無法顯示回應，處理失敗：{str(e)}。請稍後重試。"
                 placeholder.markdown(error_message)
-                st.session_state.chat_history.append({
-                    "question": user_input,
-                    "response": error_message,
-                    "debug_info": debug_info,
-                    "timestamp": current_time
-                })
-                logger.error(f"Stream processing failed: question={user_input}, platform={platform}, error={str(e)}")
-                st.session_state.processing_request = False
-                return
+                response_text = error_message
             
             if result.get("rate_limit_info"):
                 debug_info.append("#### 調試信息：")
@@ -283,14 +289,14 @@ async def chat_page():
             
             if not any(
                 chat["question"] == user_input and 
-                chat["response"] == response and 
+                chat["response"] == response_text and 
                 not chat.get("is_preview") and 
                 abs(chat["timestamp"] - current_time) < 1
                 for chat in st.session_state.chat_history
             ):
                 st.session_state.chat_history.append({
                     "question": user_input,
-                    "response": response,
+                    "response": response_text,
                     "debug_info": debug_info if debug_info else None,
                     "analysis": result.get("analysis"),
                     "timestamp": current_time

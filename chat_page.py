@@ -263,33 +263,28 @@ async def chat_page():
                     response_text = f"**分享文字**：{share_text}\n\n**選擇理由**：{reason}"
                     placeholder.markdown(response_text)
                 else:
-                    # 使用 st.write_stream 處理生成器
+                    # 使用 st.write_stream 處理異步生成器
                     full_response = []
                     try:
-                        # 將異步生成器轉為同步迭代器
-                        def sync_generator():
-                            loop = asyncio.new_event_loop()
-                            asyncio.set_event_loop(loop)
+                        # 使用現有事件循環迭代生成器
+                        async def async_to_sync_generator():
                             try:
-                                while True:
-                                    try:
-                                        future = asyncio.ensure_future(response.__anext__())
-                                        chunk = loop.run_until_complete(future)
-                                        if isinstance(chunk, str):
-                                            yield chunk
-                                        else:
-                                            logger.warning(f"Non-string chunk received: {chunk}")
-                                            yield str(chunk)
-                                    except StopAsyncIteration:
-                                        break
-                                    except Exception as e:
-                                        yield f"無法顯示回應，API 連接失敗：{str(e)}。請稍後重試。\n"
-                                        break
-                            finally:
-                                loop.close()
+                                async for chunk in response:
+                                    if isinstance(chunk, str):
+                                        yield chunk
+                                    else:
+                                        logger.warning(f"Non-string chunk received: {chunk}")
+                                        yield str(chunk)
+                            except Exception as e:
+                                logger.error(f"Stream error in async_to_sync_generator: error={str(e)}")
+                                yield f"無法顯示回應，API 連接失敗：{str(e)}。請稍後重試。\n"
+
+                        # 在現有事件循環中運行
+                        loop = asyncio.get_running_loop()
+                        iterator = async_to_sync_generator()
                         
                         # 使用 st.write_stream 迭代並收集結果
-                        response_text = st.write_stream(sync_generator())
+                        response_text = st.write_stream(iterator)
                         if isinstance(response_text, str):
                             full_response.append(response_text)
                         elif isinstance(response_text, list):
@@ -299,12 +294,14 @@ async def chat_page():
                         response_text = "".join(str(item) for item in full_response) if full_response else "無回應內容，請稍後重試。"
                         placeholder.markdown(response_text)
                     except Exception as e:
+                        logger.error(f"Stream processing error: error={str(e)}")
                         debug_info.append(f"#### 調試信息：\n- 流式處理錯誤: 原因={str(e)}")
                         error_message = f"無法顯示回應，API 連接失敗：{str(e)}。請稍後重試。"
                         full_response.append(error_message)
                         response_text = error_message
                         placeholder.markdown(response_text)
             except Exception as e:
+                logger.error(f"General processing error: error={str(e)}")
                 debug_info.append(f"#### 調試信息：\n- 處理錯誤: 原因={str(e)}")
                 error_message = f"無法顯示回應，處理失敗：{str(e)}。請檢查問題格式或稍後重試。"
                 response_text = error_message

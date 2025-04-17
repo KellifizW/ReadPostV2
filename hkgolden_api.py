@@ -10,6 +10,15 @@ from utils import clean_html
 
 logger = streamlit.logger.get_logger(__name__)
 
+def validate_config():
+    """驗證 HKGOLDEN_API 配置"""
+    required_keys = ["BASE_URL", "USER_AGENT", "CATEGORIES", "MAX_PAGES", "RATE_LIMIT", "RATE_LIMIT_DURATION", "RATE_LIMIT_RESET"]
+    missing_keys = [key for key in required_keys if key not in HKGOLDEN_API]
+    if missing_keys:
+        logger.error(f"Missing HKGOLDEN_API configuration keys: {missing_keys}")
+        raise KeyError(f"Missing configuration keys: {missing_keys}")
+    logger.debug(f"HKGOLDEN_API configuration: {HKGOLDEN_API}")
+
 async def fetch_page(session, url, headers, page, cat_id, sub_cat_id):
     """抓取單頁數據"""
     params = {
@@ -54,10 +63,19 @@ async def fetch_thread_replies(session, thread_id, page, headers):
 
 async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, request_counter, last_reset, rate_limit_until):
     """抓取高登討論區帖子列表"""
+    try:
+        validate_config()  # 驗證配置
+    except KeyError as e:
+        logger.error(f"Configuration validation failed: {str(e)}")
+        return {"items": [], "rate_limit_info": [f"Configuration error: {str(e)}"], "request_counter": request_counter, "last_reset": last_reset, "rate_limit_until": rate_limit_until}
+    
     current_time = time.time()
+    logger.debug(f"Initializing get_hkgolden_topic_list: current_time={current_time}, last_reset={last_reset}, request_counter={request_counter}, rate_limit_until={rate_limit_until}")
+    
     if current_time - last_reset > HKGOLDEN_API["RATE_LIMIT_RESET"]:
         request_counter = 0
         last_reset = current_time
+        logger.debug(f"Rate limit reset: request_counter={request_counter}, last_reset={last_reset}")
     
     if current_time < rate_limit_until:
         logger.warning(f"Rate limit active until {datetime.fromtimestamp(rate_limit_until).strftime('%Y-%m-%d %H:%M:%S')}")

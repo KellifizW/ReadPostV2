@@ -30,6 +30,70 @@ def clean_reply_text(text):
     text = ' '.join(text.split())
     return text
 
+async def analyze_user_question(question, platform):
+    """使用Grok 3分析用戶問題，決定需要抓取的數據類型和數量"""
+    prompt = f"""
+你是一個智能助手，分析用戶問題以決定從討論區（{platform}）抓取哪些元數據。
+用戶問題："{question}"
+
+請回答以下問題：
+1. 問題的主要意圖是什麼？（例如：尋找特定話題、分析熱門帖子、查詢回覆數量等）
+2. 需要抓取哪些類型的數據？（例如：帖子標題、回覆內容、點讚數）
+3. 建議抓取的帖子數量（1-5個）？
+4. 每個帖子的回覆數量（1-50條）？
+5. 有無關鍵字或條件用於篩選帖子？（例如：包含特定詞語、按點讚數排序）
+
+回應格式：
+- 意圖: [描述]
+- 數據類型: [列表]
+- 帖子數量: [數字]
+- 回覆數量: [數字]
+- 篩選條件: [描述或"無"]
+"""
+    logger.info(f"Analyzing user question: question={question}, platform={platform}")
+    api_result = await call_grok3_api(prompt)
+    
+    if api_result.get("status") == "error":
+        logger.error(f"Failed to analyze question: {api_result['content']}")
+        return {
+            "intent": "unknown",
+            "data_types": ["title", "replies"],
+            "num_threads": 1,
+            "num_replies": 3,
+            "filter_condition": "none"
+        }
+    
+    content = api_result["content"].strip()
+    logger.info(f"Analysis result: {content[:200]}...")
+    
+    # 簡單解析回應（假設Grok 3遵循格式）
+    intent = "unknown"
+    data_types = ["title", "replies"]
+    num_threads = 1
+    num_replies = 3
+    filter_condition = "none"
+    
+    for line in content.split("\n"):
+        line = line.strip()
+        if line.startswith("意圖:"):
+            intent = line.replace("意圖:", "").strip()
+        elif line.startswith("數據類型:"):
+            data_types = [t.strip() for t in line.replace("數據類型:", "").strip().split(",")]
+        elif line.startswith("帖子數量:"):
+            num_threads = min(max(int(line.replace("帖子數量:", "").strip()), 1), 5)
+        elif line.startswith("回覆數量:"):
+            num_replies = min(max(int(line.replace("回覆數量:", "").strip()), 1), 50)
+        elif line.startswith("篩選條件:"):
+            filter_condition = line.replace("篩選條件:", "").strip()
+    
+    return {
+        "intent": intent,
+        "data_types": data_types,
+        "num_threads": num_threads,
+        "num_replies": num_replies,
+        "filter_condition": filter_condition
+    }
+
 async def process_user_question(question, platform, cat_id_map, selected_cat, return_prompt=False):
     """處理用戶問題並返回相關帖子數據或原始 prompt"""
     request_key = f"{question}:{platform}:{selected_cat}"
@@ -43,22 +107,30 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
             return st.session_state.get("last_result", {
                 "response": "重複請求，請稍後再試。",
                 "rate_limit_info": [],
-                "processed_data": []
+                "processed_data": [],
+                "analysis": None
             })
     
     logger.info(f"Starting to process question: question={question}, platform={platform}, category={selected_cat}")
     
     clean_expired_cache(platform)
     
-    cat_id = cat_id_map[selected_cat]
+    # 分析用戶問題
+    analysis = await analyze_user_question(question, platform)
+    logger.info(f"Question analysis: intent={analysis['intent']}, num_threads={analysis['num_threads']}, num_replies={analysis['num_replies']}")
     
+    cat_id = cat_id_map[selected_cat]
+    max_pages = max(1, analysis["num_threads"])  # 確保至少抓取1頁
+    max_replies = analysis["num_replies"]
+    
+    # 抓取帖子列表
     start_fetch_time = time.time()
     if platform == "LIHKG":
         result = await get_lihkg_topic_list(
             cat_id=cat_id,
             sub_cat_id=0,
             start_page=1,
-            max_pages=LIHKG_API["MAX_PAGES"],
+            max_pages=max_pages,
             request_counter=st.session_state.get("request_counter", 0),
             last_reset=st.session_state.get("last_reset", time.time()),
             rate_limit_until=st.session_state.get("rate_limit_until", 0)
@@ -68,7 +140,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
             cat_id=cat_id,
             sub_cat_id=0,
             start_page=1,
-            max_pages=HKGOLDEN_API["MAX_PAGES"],
+            max_pages=max_pages,
             request_counter=st.session_state.get("request_counter", 0),
             last_reset=st.session_state.get("last_reset", time.time()),
             rate_limit_until=st.session_state.get("rate_limit_until", 0)
@@ -87,84 +159,124 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
         return {
             "response": f"無法抓取帖子，API 返回空數據。請檢查分類（{selected_cat}）或稍後重試。",
             "rate_limit_info": rate_limit_info,
-            "processed_data": []
+            "processed_data": [],
+            "analysis": analysis
         }
     
-    # 優先選擇有回覆的帖子，若無則選擇任意帖子
-    items_with_replies = [item for item in items if item.get("no_of_reply", 0) > 0]
-    logger.info(f"Found {len(items_with_replies)} items with replies out of {len(items)} total items")
+    # 根據篩選條件選擇帖子
+    selected_items = []
+    filter_condition = analysis["filter_condition"].lower()
+    if filter_condition != "none":
+        keywords = filter_condition.split()
+        selected_items = [
+            item for item in items
+            if any(keyword.lower() in item["title"].lower() for keyword in keywords) and item.get("no_of_reply", 0) > 0
+        ]
+    if not selected_items:
+        selected_items = [item for item in items if item.get("no_of_reply", 0) > 0]
+    if not selected_items:
+        selected_items = items
     
-    if items_with_replies:
-        selected_item = random.choice(items_with_replies)
-    else:
-        logger.warning("No items with replies found, selecting a post without replies")
-        selected_item = random.choice(items)
+    # 隨機選擇指定數量的帖子
+    num_threads = min(analysis["num_threads"], len(selected_items))
+    selected_items = random.sample(selected_items, num_threads) if num_threads < len(selected_items) else selected_items
     
-    try:
-        thread_id = selected_item["thread_id"] if platform == "LIHKG" else selected_item["id"]
-    except KeyError as e:
-        logger.error(f"Missing thread_id or id in selected_item: {selected_item}, error={str(e)}")
-        return {
-            "response": "無法提取帖子 ID，請稍後重試。",
-            "rate_limit_info": rate_limit_info,
-            "processed_data": []
-        }
+    processed_data = []
+    threads_data = []
     
-    thread_title = selected_item["title"]
-    no_of_reply = selected_item.get("no_of_reply", 0)
-    logger.info(f"Selected thread: thread_id={thread_id}, title={thread_title}, no_of_reply={no_of_reply}")
-    
-    # 抓取帖子回覆內容
-    logger.info(f"Fetching thread content: thread_id={thread_id}, platform={platform}")
-    if platform == "LIHKG":
-        thread_result = await get_lihkg_thread_content(
-            thread_id=thread_id,
-            cat_id=cat_id,
-            request_counter=st.session_state.request_counter,
-            last_reset=st.session_state.last_reset,
-            rate_limit_until=st.session_state.rate_limit_until
-        )
-    else:
-        thread_result = await get_hkgolden_thread_content(
-            thread_id=thread_id,
-            cat_id=cat_id,
-            request_counter=st.session_state.request_counter,
-            last_reset=st.session_state.last_reset,
-            rate_limit_until=st.session_state.rate_limit_until
-        )
-    
-    replies = thread_result["replies"]
-    thread_title = thread_result["title"] or thread_title
-    rate_limit_info.extend(thread_result["rate_limit_info"])
-    st.session_state.request_counter = thread_result["request_counter"]
-    st.session_state.rate_limit_until = thread_result["rate_limit_until"]
-    
-    logger.info(f"Thread content fetched: thread_id={thread_id}, title={thread_title}, replies={len(replies)}")
-    
-    processed_data = [
-        {
+    # 抓取每個帖子的回覆
+    for selected_item in selected_items:
+        try:
+            thread_id = selected_item["thread_id"] if platform == "LIHKG" else selected_item["id"]
+        except KeyError as e:
+            logger.error(f"Missing thread_id or id in selected_item: {selected_item}, error={str(e)}")
+            continue
+        
+        thread_title = selected_item["title"]
+        no_of_reply = selected_item.get("no_of_reply", 0)
+        logger.info(f"Selected thread: thread_id={thread_id}, title={thread_title}, no_of_reply={no_of_reply}")
+        
+        # 抓取帖子回覆
+        logger.info(f"Fetching thread content: thread_id={thread_id}, platform={platform}")
+        if platform == "LIHKG":
+            thread_result = await get_lihkg_thread_content(
+                thread_id=thread_id,
+                cat_id=cat_id,
+                request_counter=st.session_state.request_counter,
+                last_reset=st.session_state.last_reset,
+                rate_limit_until=st.session_state.rate_limit_until,
+                max_replies=max_replies
+            )
+        else:
+            thread_result = await get_hkgolden_thread_content(
+                thread_id=thread_id,
+                cat_id=cat_id,
+                request_counter=st.session_state.request_counter,
+                last_reset=st.session_state.last_reset,
+                rate_limit_until=st.session_state.rate_limit_until,
+                max_replies=max_replies
+            )
+        
+        replies = thread_result["replies"]
+        thread_title = thread_result["title"] or thread_title
+        rate_limit_info.extend(thread_result["rate_limit_info"])
+        st.session_state.request_counter = thread_result["request_counter"]
+        st.session_state.rate_limit_until = thread_result["rate_limit_until"]
+        
+        logger.info(f"Thread content fetched: thread_id={thread_id}, title={thread_title}, replies={len(replies)}")
+        
+        thread_data = {
             "thread_id": thread_id,
             "title": thread_title,
-            "content": clean_reply_text(reply["msg"]),
-            "like_count": reply.get("like_count", 0),
-            "dislike_count": reply.get("dislike_count", 0)
+            "replies": [
+                {
+                    "content": clean_reply_text(reply["msg"]),
+                    "like_count": reply.get("like_count", 0),
+                    "dislike_count": reply.get("dislike_count", 0)
+                }
+                for reply in replies
+            ]
         }
-        for reply in replies
-    ]
+        threads_data.append(thread_data)
+        
+        processed_data.extend([
+            {
+                "thread_id": thread_id,
+                "title": thread_title,
+                "content": clean_reply_text(reply["msg"]),
+                "like_count": reply.get("like_count", 0),
+                "dislike_count": reply.get("dislike_count", 0)
+            }
+            for reply in replies
+        ])
     
-    cleaned_replies = [clean_reply_text(r["msg"])[:100] + '...' if len(clean_reply_text(r["msg"])) > 100 else clean_reply_text(r["msg"]) for r in replies[:3]]
+    # 生成提示
     prompt = f"""
-You are Grok, sharing a notable post from {platform} ({selected_cat} category). Below is a selected post chosen for its relevance.
+你是一個智能助手，從 {platform}（{selected_cat} 分類）分享有趣的帖子。以下是用戶問題和分析結果，以及選定的帖子數據。
 
-Post data:
-- ID: {thread_id}
-- Title: {thread_title}
-- Replies: {', '.join(cleaned_replies) if cleaned_replies else 'No replies yet'}
+用戶問題："{question}"
+分析結果：
+- 意圖：{analysis['intent']}
+- 數據類型：{', '.join(analysis['data_types'])}
+- 篩選條件：{analysis['filter_condition']}
 
-Generate a concise sharing text (max 280 characters) highlighting why this post is engaging, including the title and a snippet of the first reply if available.
+帖子數據：
+"""
+    for thread in threads_data:
+        prompt += f"""
+- 帖子 ID：{thread['thread_id']}
+- 標題：{thread['title']}
+- 回覆（前 {len(thread['replies'])} 條）：
+"""
+        for reply in thread["replies"]:
+            content = reply["content"][:100] + '...' if len(reply["content"]) > 100 else reply["content"]
+            prompt += f"  - {content}（正評：{reply['like_count']}，負評：{reply['dislike_count']}）\n"
+    
+    prompt += """
+根據用戶問題和帖子數據，生成一段簡潔的分享文字（最多280字），突出帖子的吸引之處，並包含標題和首條回覆的片段（若有）。
 
-Example:
-Hot {platform} post! "{thread_title[:50]}" sparks debate. First reply: "{cleaned_replies[0][:50] if cleaned_replies else 'None'}". Check it out!
+範例：
+熱門 {platform} 帖子！"{threads_data[0]['title'][:50]}" 引發熱議。首條回覆："{threads_data[0]['replies'][0]['content'][:50] if threads_data and threads_data[0]['replies'] else '無回覆'}"。快來看看！
 
 {{ output }}
 """
@@ -175,9 +287,11 @@ Hot {platform} post! "{thread_title[:50]}" sparks debate. First reply: "{cleaned
         return {
             "response": prompt,
             "rate_limit_info": rate_limit_info,
-            "processed_data": processed_data
+            "processed_data": processed_data,
+            "analysis": analysis
         }
     
+    # 調用Grok 3生成回應
     start_api_time = time.time()
     api_result = await call_grok3_api(prompt)
     api_elapsed = time.time() - start_api_time
@@ -185,23 +299,27 @@ Hot {platform} post! "{thread_title[:50]}" sparks debate. First reply: "{cleaned
     
     if api_result.get("status") == "error":
         logger.warning(f"Falling back to local response due to Grok 3 API failure: {api_result['content']}")
-        first_reply = cleaned_replies[0][:50] if cleaned_replies else "無回覆"
         response = f"""
-Hot thread on {platform}! "{thread_title[:50]}" sparks discussion. First reply: "{first_reply}".
-
-Details:
-- ID: {thread_id}
-- Title: {thread_title}
+熱門帖子來自 {platform}！問題意圖：{analysis['intent']}。
 """
-        for i, data in enumerate(processed_data[:3], 1):
-            response += f"\n回覆 {i}：{data['content'][:50]}...\n讚好：{data['like_count']}，點踩：{data['dislike_count']}\n"
+        for thread in threads_data[:1]:
+            first_reply = thread["replies"][0]["content"][:50] if thread["replies"] else "無回覆"
+            response += f"""
+- "{thread['title'][:50]}" 引發討論。首條回覆："{first_reply}"。
+詳細：
+- ID：{thread['thread_id']}
+- 標題：{thread['title']}
+"""
+            for i, reply in enumerate(thread["replies"][:3], 1):
+                response += f"\n回覆 {i}：{reply['content'][:50]}...\n正評：{reply['like_count']}，負評：{reply['dislike_count']}\n"
     else:
         response = api_result["content"].strip()
     
     result = {
         "response": response,
         "rate_limit_info": rate_limit_info,
-        "processed_data": processed_data
+        "processed_data": processed_data,
+        "analysis": analysis
     }
     with processing_lock:
         st.session_state["last_request_key"] = request_key

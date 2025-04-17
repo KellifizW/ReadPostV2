@@ -41,6 +41,14 @@ async def chat_page():
     
     selected_cat = st.selectbox("選擇分類", options=list(categories.keys()), index=0)
     
+    # 添加最少回覆數量選擇框
+    min_replies = st.selectbox(
+        "選擇最少回覆數量",
+        options=[10, 20, 30, 50],
+        index=1,  # 預設為 20
+        help="選擇帖子必須具備的最少回覆數量。降低此值可能獲得更多結果。"
+    )
+    
     st.markdown("### 聊天記錄")
     for chat in st.session_state.chat_history:
         with st.chat_message("user"):
@@ -52,10 +60,10 @@ async def chat_page():
                     for info in chat["debug_info"]:
                         st.markdown(info)
     
-    user_input = st.chat_input("輸入你的問題或要求（例如：分享任何帖文）")
+    user_input = st.chat_input("輸入你的問題或要求（例如：分享一個有趣的帖文）")
     
     if user_input:
-        submit_key = f"{user_input}:{platform}:{selected_cat}"
+        submit_key = f"{user_input}:{platform}:{selected_cat}:{min_replies}"
         current_time = time.time()
         if (st.session_state.last_submit_key == submit_key and 
             current_time - st.session_state.last_submit_time < 5):
@@ -70,22 +78,23 @@ async def chat_page():
             placeholder = st.empty()
             debug_info = []
             
-            cache_key = f"{platform}_{selected_cat}_{user_input}"
+            cache_key = f"{platform}_{selected_cat}_{user_input}_{min_replies}"
             use_cache = cache_key in st.session_state.thread_content_cache and \
                         time.time() - st.session_state.thread_content_cache[cache_key]["timestamp"] < \
                         (LIHKG_API["CACHE_DURATION"] if platform == "LIHKG" else HKGOLDEN_API["CACHE_DURATION"])
             
             if use_cache:
-                logger.info(f"Using cache: platform={platform}, category={selected_cat}, question={user_input}")
+                logger.info(f"Using cache: platform={platform}, category={selected_cat}, question={user_input}, min_replies={min_replies}")
                 result = st.session_state.thread_content_cache[cache_key]["data"]
             else:
                 try:
-                    logger.info(f"Starting to process question: question={user_input}, platform={platform}, category={selected_cat}")
+                    logger.info(f"Starting to process question: question={user_input}, platform={platform}, category={selected_cat}, min_replies={min_replies}")
                     result = await process_user_question(
                         user_input,
                         platform=platform,
                         cat_id_map=categories,
-                        selected_cat=selected_cat
+                        selected_cat=selected_cat,
+                        min_replies=min_replies  # 傳遞用戶選擇的最少回覆數量
                     )
                     st.session_state.thread_content_cache[cache_key] = {
                         "data": result,
@@ -97,7 +106,7 @@ async def chat_page():
                     if result.get("rate_limit_info"):
                         debug_info.append("- 速率限制或錯誤記錄：")
                         debug_info.extend(f"  - {info}" for info in result["rate_limit_info"])
-                    error_message = f"處理失敗，原因：{repr(e)}"
+                    error_message = f"處理失敗，原因：{repr(e)}。請嘗試降低最少回覆數量或更改分類。"
                     placeholder.markdown(error_message)
                     st.session_state.chat_history.append({
                         "question": user_input,

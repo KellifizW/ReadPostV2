@@ -426,7 +426,7 @@ async def get_hkgolden_thread_content(thread_id, cat_id=None, request_counter=0,
                                 "like_count": reply.get("like_count", 0),
                                 "dislike_count": reply.get("dislike_count", 0)
                             }
-                            for reply in new_replies
+                            for reply in new_replies if reply.get("content", "").strip()
                         ]
                         
                         replies.extend(standardized_replies)
@@ -465,8 +465,9 @@ async def get_hkgolden_thread_content(thread_id, cat_id=None, request_counter=0,
         
         # 總結日誌
         pages_str = f"1-{max(pages_fetched)}" if pages_fetched else "none"
+        empty_replies = len(new_replies) - len(standardized_replies) if new_replies else 0
         logger.info(
-            f"Fetched {len(replies)} replies for id={thread_id}, pages={pages_str}, tr={total_replies}, requests={request_counter_increment}"
+            f"Fetched {len(replies)} replies for id={thread_id}, pages={pages_str}, tr={total_replies}, requests={request_counter_increment}, empty_replies={empty_replies}"
         )
     
     result = {

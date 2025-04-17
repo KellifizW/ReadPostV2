@@ -1,4 +1,3 @@
-```python
 import streamlit as st
 import streamlit.logger
 import aiohttp
@@ -167,4 +166,3 @@ async def stream_grok3_response(prompt: str) -> AsyncGenerator[dict, None]:
             yield {"content": f"Error: API unexpected error - {str(e)}", "status": "error"}
         finally:
             await retry_client.close()
-```

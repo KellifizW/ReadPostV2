@@ -39,17 +39,17 @@ async def analyze_user_question(question, platform):
 用戶問題："{question}"
 
 請回答以下問題：
-1. 問題的主要意圖是什麼？（例如：尋找特定話題、分析熱門帖子、查詢回覆數量等）
+1. 問題的主要意圖是什麼？（例如：尋找特定話題、分享熱門帖子、推薦今日必睇帖子等）
 2. 需要抓取哪些類型的數據？（例如：帖子標題、回覆數量、最後回覆時間、帖子點讚數、帖子負評數、回覆內容）
-3. 建議抓取的帖子數量（1-5個）？
+3. 建議抓取的帖子數量（1-5個，根據問題需求明確指定）？
 4. 建議抓取的回覆數量或閱讀策略？（例如：「全部回覆」「最多100條」「最新50條」「根據內容相關性選擇」）
-5. 有無關鍵字或條件用於篩選帖子？（例如：包含特定詞語、按回覆數排序）
+5. 有無關鍵字或條件用於篩選帖子？（例如：包含特定詞語、按回覆數排序、今日發佈）
 
 回應格式：
 - 意圖: [描述]
 - 數據類型: [列表]
 - 帖子數量: [數字]
-- 回覆策略: [描述，例如「全部回覆」或「最多100條」]
+- 回覆策略: [描述，例如「全部回覆」或「最新50條」]
 - 篩選條件: [描述或"無"]
 """
     logger.info(f"Analyzing user question: question={question}, platform={platform}")
@@ -91,10 +91,16 @@ async def analyze_user_question(question, platform):
         elif line.startswith("篩選條件:"):
             filter_condition = line.replace("篩選條件:", "").strip()
     
-    # 確保數據類型包含必要字段
-    if "最多回覆" in content or "回覆數量最多" in content:
-        intent = "尋找回覆數量最多的帖子"
-        reply_strategy = "全部回覆"
+    # 改進意圖解析
+    if "分享" in question.lower() and "個" in question:
+        # 提取用戶指定的帖子數量（例如「3個」）
+        match = re.search(r'(\d+)個', question)
+        if match:
+            num_threads = min(max(int(match.group(1)), 1), 5)
+            intent = f"分享{num_threads}個指定帖子"
+    if "今日" in question.lower() or "今日必睇" in question.lower():
+        intent = "分享今日必睇帖子"
+        filter_condition = "優先選擇今日發佈或最後回覆時間在今日的帖子，若不足則選擇回覆數最多的帖子"
         data_types.extend(["last_reply_time", "like_count", "dislike_count"])
     
     return {
@@ -126,7 +132,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
     logger.info(f"Question analysis: intent={analysis['intent']}, num_threads={analysis['num_threads']}, reply_strategy={analysis['reply_strategy']}")
     
     cat_id = cat_id_map[selected_cat]
-    max_pages = 5 if "最多回覆" in analysis["intent"] else max(1, analysis["num_threads"])
+    max_pages = max(5, analysis["num_threads"])  # 確保抓取足夠的帖子
     logger.info(f"Fetching threads with reply_strategy={analysis['reply_strategy']}")
     
     # 抓取帖子列表
@@ -175,35 +181,51 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
     # 根據篩選條件選擇帖子
     selected_items = []
     filter_condition = analysis["filter_condition"].lower()
+    today = datetime.now().date()
+    
     if filter_condition != "none":
-        if "回覆數量由高到低" in filter_condition or "按回覆數排序" in filter_condition:
-            # 優先選擇符合關鍵字的帖子
-            keywords = [k for k in filter_condition.split() if k in ["on9", "傻", "搞笑"]]
-            if keywords:
-                selected_items = [
-                    item for item in items
-                    if any(keyword.lower() in item["title"].lower() for keyword in keywords) and item.get("no_of_reply", 0) > 0
-                ]
-            # 若關鍵字匹配不足，選擇回覆數最多的帖子
-            if len(selected_items) < analysis["num_threads"]:
-                selected_items.extend(
-                    sorted(
-                        [item for item in items if item.get("no_of_reply", 0) > 0 and item not in selected_items],
-                        key=lambda x: x.get("no_of_reply", 0),
-                        reverse=True
-                    )
+        # 檢查今日帖子
+        today_items = []
+        other_items = []
+        for item in items:
+            last_reply_time = item.get("last_reply_time", 0)
+            if last_reply_time:
+                try:
+                    reply_date = datetime.fromtimestamp(last_reply_time).date()
+                    if reply_date == today:
+                        today_items.append(item)
+                    else:
+                        other_items.append(item)
+                except ValueError:
+                    other_items.append(item)
+            else:
+                other_items.append(item)
+        
+        # 優先選擇今日帖子
+        if "今日" in filter_condition:
+            selected_items = sorted(
+                today_items,
+                key=lambda x: x.get("no_of_reply", 0) + x.get("like_count", 0) - x.get("dislike_count", 0),
+                reverse=True
+            )
+        
+        # 若今日帖子不足，補充其他熱門帖子
+        if len(selected_items) < analysis["num_threads"]:
+            selected_items.extend(
+                sorted(
+                    other_items,
+                    key=lambda x: x.get("no_of_reply", 0) + x.get("like_count", 0) - x.get("dislike_count", 0),
+                    reverse=True
                 )
-            selected_items = selected_items[:analysis["num_threads"]]
-        else:
-            keywords = filter_condition.split()
-            selected_items = [
-                item for item in items
-                if any(keyword.lower() in item["title"].lower() for keyword in keywords) and item.get("no_of_reply", 0) > 0
-            ]
+            )
+        
+        selected_items = selected_items[:analysis["num_threads"]]
+    
+    # 若無符合條件的帖子，選擇回覆數最多的帖子
     if not selected_items:
         selected_items = sorted(
             [item for item in items if item.get("no_of_reply", 0) > 0],
-            key=lambda x: x.get("no_of_reply", 0),
+            key=lambda x: x.get("no_of_reply", 0) + x.get("like_count", 0) - x.get("dislike_count", 0),
             reverse=True
         )[:analysis["num_threads"]]
     
@@ -225,8 +247,13 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
         no_of_reply = selected_item.get("no_of_reply", 0)
         logger.info(f"Selected thread: thread_id={thread_id}, title={thread_title}, no_of_reply={no_of_reply}")
         
-        # 抓取所有回覆
+        # 根據回覆策略設置 max_replies
         thread_max_replies = no_of_reply
+        if "最新" in analysis["reply_strategy"].lower():
+            match = re.search(r'最新(\d+)條', analysis["reply_strategy"])
+            if match:
+                thread_max_replies = min(no_of_reply, int(match.group(1)))
+        
         logger.info(f"Fetching thread content: thread_id={thread_id}, platform={platform}, max_replies={thread_max_replies}")
         
         if platform == "LIHKG":
@@ -291,6 +318,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
 分析結果：
 - 意圖：{analysis['intent']}
 - 數據類型：{', '.join(analysis['data_types'])}
+- 帖子數量：{analysis['num_threads']}
 - 回覆策略：{analysis['reply_strategy']}
 - 篩選條件：{analysis['filter_condition']}
 
@@ -322,8 +350,8 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
     
     prompt += f"""
 請完成以下任務：
-1. 生成一段簡潔的分享文字，嚴格限制在 500 字以內，突出帖子的吸引之處，包含標題、回覆數量和首條回覆的片段（若有）。可根據需要使用帖子 ID、最後回覆時間、點讚數或負評數來增強分享內容。
-2. 提供一段簡短的選擇理由（150 字以內），解釋為何選擇此帖子（例如話題性、幽默性、爭議性、回覆數量多等）。
+1. 生成一段簡潔的分享文字，嚴格限制在 500 字以內，分享 {analysis['num_threads']} 個帖子，突出每個帖子的吸引之處，包含標題、回覆數量和首條回覆的片段（若有）。可根據需要使用帖子 ID、最後回覆時間、點讚數或負評數來增強分享內容。
+2. 提供一段簡短的選擇理由（150 字以內），解釋為何選擇這些帖子（例如話題性、幽默性、爭議性、回覆數量多等）。
 3. 若回覆數量過多，根據回覆策略（{analysis['reply_strategy']}）優先總結最新或最相關的回覆內容。
 
 回應格式：
@@ -357,7 +385,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
         response = f"""
 熱門帖子來自 {platform}！問題意圖：{analysis['intent']}。
 """
-        for thread in threads_data[:1]:
+        for thread in threads_data[:analysis["num_threads"]]:
             first_reply = thread["replies"][0]["content"][:50] if thread["replies"] else "無回覆"
             response += f"""
 - "{thread['title'][:50]}"（{thread['no_of_reply']} 條回覆）引發討論。首條回覆："{first_reply}"。
@@ -366,8 +394,10 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
     else:
         # 改進回應提取邏輯
         content = api_result["content"].strip()
-        # 清理 { output } 標記
+        # 清理 { output } 標記和其他多餘內容
         content = re.sub(r'\{\{ output \}\}', '', content).strip()
+        content = re.sub(r'^\s*選擇理由\s*[:：]?\s*', '', content, flags=re.MULTILINE).strip()
+        
         share_text = "無分享文字"
         reason = "無選擇理由"
         

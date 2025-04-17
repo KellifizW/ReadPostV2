@@ -15,6 +15,7 @@ from threading import Lock
 logger = streamlit.logger.get_logger(__name__)
 processing_lock = Lock()
 active_requests = {}
+MAX_PROMPT_LENGTH = 30000  # 假設 Grok 3 API 輸入限制為 30,000 字元
 
 def clean_expired_cache(platform):
     """清理過期緩存"""
@@ -41,14 +42,14 @@ async def analyze_user_question(question, platform):
 1. 問題的主要意圖是什麼？（例如：尋找特定話題、分析熱門帖子、查詢回覆數量等）
 2. 需要抓取哪些類型的數據？（例如：帖子標題、回覆數量、最後回覆時間、帖子點讚數、帖子負評數、回覆內容）
 3. 建議抓取的帖子數量（1-5個）？
-4. 每個帖子的回覆數量（1-100條）？
+4. 建議抓取的回覆數量或閱讀策略？（例如：「全部回覆」「最多100條」「最新50條」「根據內容相關性選擇」）
 5. 有無關鍵字或條件用於篩選帖子？（例如：包含特定詞語、按回覆數排序）
 
 回應格式：
 - 意圖: [描述]
 - 數據類型: [列表]
 - 帖子數量: [數字]
-- 回覆數量: [數字]
+- 回覆策略: [描述，例如「全部回覆」或「最多100條」]
 - 篩選條件: [描述或"無"]
 """
     logger.info(f"Analyzing user question: question={question}, platform={platform}")
@@ -60,7 +61,7 @@ async def analyze_user_question(question, platform):
             "intent": "unknown",
             "data_types": ["title", "no_of_reply", "replies"],
             "num_threads": 1,
-            "num_replies": 10,
+            "reply_strategy": "全部回覆",
             "filter_condition": "none"
         }
     
@@ -71,7 +72,7 @@ async def analyze_user_question(question, platform):
     intent = "unknown"
     data_types = ["title", "no_of_reply", "replies"]
     num_threads = 1
-    num_replies = 10
+    reply_strategy = "全部回覆"
     filter_condition = "none"
     
     for line in content.split("\n"):
@@ -85,26 +86,22 @@ async def analyze_user_question(question, platform):
                 num_threads = min(max(int(line.replace("帖子數量:", "").strip()), 1), 5)
             except ValueError:
                 pass
-        elif line.startswith("回覆數量:"):
-            try:
-                num_replies = min(max(int(line.replace("回覆數量:", "").strip()), 1), 100)
-            except ValueError:
-                pass
+        elif line.startswith("回覆策略:"):
+            reply_strategy = line.replace("回覆策略:", "").strip()
         elif line.startswith("篩選條件:"):
             filter_condition = line.replace("篩選條件:", "").strip()
     
-    # 改進意圖解析，確保「最多回覆」設置 num_replies=100
+    # 確保數據類型包含必要字段
     if "最多回覆" in content or "回覆數量最多" in content:
         intent = "尋找回覆數量最多的帖子"
-        num_replies = 100
-        filter_condition = "按回覆數量由高到低排序"
+        reply_strategy = "全部回覆"
         data_types.extend(["last_reply_time", "like_count", "dislike_count"])
     
     return {
         "intent": intent,
         "data_types": data_types,
         "num_threads": num_threads,
-        "num_replies": num_replies,
+        "reply_strategy": reply_strategy,
         "filter_condition": filter_condition
     }
 
@@ -126,12 +123,11 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
     
     # 分析用戶問題
     analysis = await analyze_user_question(question, platform)
-    logger.info(f"Question analysis: intent={analysis['intent']}, num_threads={analysis['num_threads']}, num_replies={analysis['num_replies']}")
+    logger.info(f"Question analysis: intent={analysis['intent']}, num_threads={analysis['num_threads']}, reply_strategy={analysis['reply_strategy']}")
     
     cat_id = cat_id_map[selected_cat]
     max_pages = 5 if "最多回覆" in analysis["intent"] else max(1, analysis["num_threads"])
-    max_replies = min(analysis["num_replies"], 100)
-    logger.info(f"Fetching thread with max_replies={max_replies}")
+    logger.info(f"Fetching threads with reply_strategy={analysis['reply_strategy']}")
     
     # 抓取帖子列表
     start_fetch_time = time.time()
@@ -180,7 +176,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
     selected_items = []
     filter_condition = analysis["filter_condition"].lower()
     if filter_condition != "none":
-        if "回覆數量由高到低" in filter_condition:
+        if "回覆數量由高到低" in filter_condition or "按回覆數排序" in filter_condition:
             # 優先選擇符合關鍵字的帖子
             keywords = [k for k in filter_condition.split() if k in ["on9", "傻", "搞笑"]]
             if keywords:
@@ -229,8 +225,8 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
         no_of_reply = selected_item.get("no_of_reply", 0)
         logger.info(f"Selected thread: thread_id={thread_id}, title={thread_title}, no_of_reply={no_of_reply}")
         
-        # 動態設置 max_replies 為帖子總回覆數（最多 100）
-        thread_max_replies = min(no_of_reply, max_replies) if no_of_reply > 0 else max_replies
+        # 抓取所有回覆
+        thread_max_replies = no_of_reply
         logger.info(f"Fetching thread content: thread_id={thread_id}, platform={platform}, max_replies={thread_max_replies}")
         
         if platform == "LIHKG":
@@ -287,7 +283,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
             for reply in replies
         ])
     
-    # 生成提示
+    # 生成提示，動態截斷回覆以適應輸入限制
     prompt = f"""
 你是一個智能助手，從 {platform}（{selected_cat} 分類）分享有趣的帖子。以下是用戶問題和分析結果，以及選定的帖子數據。
 
@@ -295,6 +291,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
 分析結果：
 - 意圖：{analysis['intent']}
 - 數據類型：{', '.join(analysis['data_types'])}
+- 回覆策略：{analysis['reply_strategy']}
 - 篩選條件：{analysis['filter_condition']}
 
 帖子數據：
@@ -308,16 +305,26 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
 - 最後回覆時間：{datetime.fromtimestamp(thread['last_reply_time']).strftime('%Y-%m-%d %H:%M:%S') if thread['last_reply_time'] else '未知'}
 - 點讚數：{thread['like_count']}
 - 負評數：{thread['dislike_count']}
-- 回覆（前 {len(thread['replies'])} 條）：
+- 回覆（共 {len(thread['replies'])} 條）：
 """
+        # 動態截斷回覆
+        max_replies = len(thread["replies"])
+        reply_count = 0
         for reply in thread["replies"]:
             content = reply["content"][:100] + '...' if len(reply["content"]) > 100 else reply["content"]
-            prompt += f"  - {content}\n"
+            reply_line = f"  - {content}\n"
+            if len(prompt) + len(reply_line) > MAX_PROMPT_LENGTH:
+                break
+            prompt += reply_line
+            reply_count += 1
+        if reply_count < max_replies:
+            prompt += f"  - [因長度限制，僅顯示前 {reply_count} 條回覆，總共 {max_replies} 條]\n"
     
     prompt += f"""
 請完成以下任務：
 1. 生成一段簡潔的分享文字，嚴格限制在 500 字以內，突出帖子的吸引之處，包含標題、回覆數量和首條回覆的片段（若有）。可根據需要使用帖子 ID、最後回覆時間、點讚數或負評數來增強分享內容。
 2. 提供一段簡短的選擇理由（150 字以內），解釋為何選擇此帖子（例如話題性、幽默性、爭議性、回覆數量多等）。
+3. 若回覆數量過多，根據回覆策略（{analysis['reply_strategy']}）優先總結最新或最相關的回覆內容。
 
 回應格式：
 {{ output }}

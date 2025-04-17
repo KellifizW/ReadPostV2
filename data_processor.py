@@ -90,8 +90,18 @@ async def process_user_question(question, platform, cat_id_map, selected_cat):
             "processed_data": []
         }
     
-    # 隨機選擇一個帖子（移除所有篩選）
-    selected_item = random.choice(items)
+    # 過濾掉無回覆的帖子，選擇有回覆的帖子
+    items_with_replies = [item for item in items if item.get("no_of_reply", 0) > 0]
+    if not items_with_replies:
+        logger.error("No items with replies found")
+        return {
+            "response": f"無符合條件的帖子（所有帖子均無回覆）。請檢查分類（{selected_cat}）或稍後重試。",
+            "rate_limit_info": rate_limit_info,
+            "processed_data": []
+        }
+    
+    # 隨機選擇一個有回覆的帖子
+    selected_item = random.choice(items_with_replies)
     
     try:
         thread_id = selected_item["thread_id"] if platform == "LIHKG" else selected_item["id"]
@@ -104,7 +114,31 @@ async def process_user_question(question, platform, cat_id_map, selected_cat):
         }
     
     thread_title = selected_item["title"]
-    replies = selected_item.get("replies", [])
+    
+    # 抓取帖子回覆內容
+    logger.info(f"Fetching thread content: thread_id={thread_id}, platform={platform}")
+    if platform == "LIHKG":
+        thread_result = await get_lihkg_thread_content(
+            thread_id=thread_id,
+            cat_id=cat_id,
+            request_counter=st.session_state.request_counter,
+            last_reset=st.session_state.last_reset,
+            rate_limit_until=st.session_state.rate_limit_until
+        )
+    else:
+        thread_result = await get_hkgolden_thread_content(
+            thread_id=thread_id,
+            cat_id=cat_id,
+            request_counter=st.session_state.request_counter,
+            last_reset=st.session_state.last_reset,
+            rate_limit_until=st.session_state.rate_limit_until
+        )
+    
+    replies = thread_result["replies"]
+    thread_title = thread_result["title"] or thread_title
+    rate_limit_info.extend(thread_result["rate_limit_info"])
+    st.session_state.request_counter = thread_result["request_counter"]
+    st.session_state.rate_limit_until = thread_result["rate_limit_until"]
     
     logger.info(f"Selected thread: thread_id={thread_id}, title={thread_title}, replies={len(replies)}")
     

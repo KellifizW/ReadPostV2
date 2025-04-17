@@ -52,16 +52,123 @@ async def chat_page():
         with st.chat_message("user"):
             st.markdown(f"**用戶**：{chat['question']}")
         with st.chat_message("assistant"):
-            st.markdown(f"**回應**：{chat['response']}")
-            if chat.get("debug_info"):
+            if chat.get("is_preview"):
+                st.markdown("**提示預覽**：")
+                st.code(chat['response'], language="text")
+            else:
+                st.markdown(f"**回應**：{chat['response']}")
+            if chat.get("debug_info") or chat.get("analysis"):
                 with st.expander("調試信息"):
-                    for info in chat["debug_info"]:
-                        st.markdown(info)
+                    if chat.get("analysis"):
+                        analysis = chat["analysis"]
+                        st.markdown("#### 問題分析：")
+                        st.markdown(f"- 意圖：{analysis['intent']}")
+                        st.markdown(f"- 數據類型：{', '.join(analysis['data_types'])}")
+                        st.markdown(f"- 帖子數量：{analysis['num_threads']}")
+                        st.markdown(f"- 回覆數量：{analysis['num_replies']}")
+                        st.markdown(f"- 篩選條件：{analysis['filter_condition']}")
+                    if chat.get("debug_info"):
+                        for info in chat["debug_info"]:
+                            st.markdown(info)
     
-    # 用戶輸入
-    user_input = st.chat_input("輸入你的問題或要求（例如：分享任何帖文）", key="chat_page_chat_input")
+    # 用戶輸入與預覽按鈕
+    col1, col2 = st.columns([4, 1])
+    with col1:
+        user_input = st.chat_input("輸入你的問題或要求（例如：分享任何帖文）", key="chat_page_chat_input")
+    with col2:
+        preview_button = st.button("預覽", key="preview_button")
+
+    # 處理預覽按鈕
+    if preview_button and user_input and not st.session_state.input_processed:
+        logger.info(f"Generating prompt preview: question={user_input}, platform={platform}, category={selected_cat}")
+        
+        # 檢查重複提交
+        submit_key = f"preview:{user_input}:{platform}:{selected_cat}"
+        current_time = time.time()
+        if (st.session_state.last_submit_key == submit_key and 
+            current_time - st.session_state.last_submit_time < 5):
+            logger.warning("Skipping duplicate preview submission")
+            st.warning("請勿重複提交相同預覽請求，請稍後再試。")
+            return
+        
+        # 標記輸入已處理
+        st.session_state.input_processed = True
+        st.session_state.last_submit_key = submit_key
+        st.session_state.last_submit_time = current_time
+
+        # 顯示用戶輸入
+        with st.chat_message("user"):
+            st.markdown(f"**用戶**：{user_input}")
+        
+        # 生成提示
+        with st.chat_message("assistant"):
+            placeholder = st.empty()
+            debug_info = []
+            
+            cache_key = f"{platform}_{selected_cat}_{user_input}"
+            use_cache = cache_key in st.session_state.thread_content_cache and \
+                        time.time() - st.session_state.thread_content_cache[cache_key]["timestamp"] < \
+                        (LIHKG_API["CACHE_DURATION"] if platform == "LIHKG" else HKGOLDEN_API["CACHE_DURATION"])
+            
+            if use_cache:
+                logger.info(f"Using cache for preview: platform={platform}, category={selected_cat}, question={user_input}")
+                result = st.session_state.thread_content_cache[cache_key]["data"]
+            else:
+                try:
+                    logger.info(f"Calling process_user_question for preview: question={user_input}, platform={platform}, category={selected_cat}")
+                    result = await process_user_question(
+                        user_input,
+                        platform=platform,
+                        cat_id_map=categories,
+                        selected_cat=selected_cat,
+                        return_prompt=True
+                    )
+                    st.session_state.thread_content_cache[cache_key] = {
+                        "data": result,
+                        "timestamp": time.time()
+                    }
+                except Exception as e:
+                    result = {}
+                    debug_info = [f"#### 調試信息：\n- 處理錯誤: 原因={str(e)}"]
+                    if result.get("rate_limit_info"):
+                        debug_info.append("- 速率限制或錯誤記錄：")
+                        debug_info.extend(f"  - {info}" for info in result["rate_limit_info"])
+                    error_message = f"生成提示失敗，原因：{str(e)}。請稍後重試或檢查 API 配置。"
+                    placeholder.markdown(error_message)
+                    st.session_state.chat_history.append({
+                        "question": user_input,
+                        "response": error_message,
+                        "debug_info": debug_info,
+                        "is_preview": True
+                    })
+                    logger.error(f"Preview failed: question={user_input}, platform={platform}, error={str(e)}")
+                    st.session_state.input_processed = False
+                    return
+            
+            prompt = result.get("response", "無提示內容")
+            placeholder.markdown("**提示預覽**：")
+            placeholder.code(prompt, language="text")
+            
+            if result.get("rate_limit_info"):
+                debug_info.append("#### 調試信息：")
+                debug_info.append("- 速率限制或錯誤記錄：")
+                debug_info.extend(f"  - {info}" for info in result["rate_limit_info"])
+            
+            # 避免重複追加聊天記錄
+            if not any(chat["question"] == user_input and chat["response"] == prompt and chat.get("is_preview") for chat in st.session_state.chat_history):
+                st.session_state.chat_history.append({
+                    "question": user_input,
+                    "response": prompt,
+                    "debug_info": debug_info if debug_info else None,
+                    "analysis": result.get("analysis"),
+                    "is_preview": True
+                })
+            
+            logger.info(f"Completed preview: question={user_input}, platform={platform}, prompt_length={len(prompt)}, chat_history_length={len(st.session_state.chat_history)}")
+            st.session_state.input_processed = False
     
-    if user_input and not st.session_state.input_processed:
+    # 處理正常提交
+    if user_input and not preview_button and not st.session_state.input_processed:
         logger.info(f"Processing user input: question={user_input}, platform={platform}, category={selected_cat}")
         
         # 檢查重複提交
@@ -134,11 +241,12 @@ async def chat_page():
                 debug_info.extend(f"  - {info}" for info in result["rate_limit_info"])
             
             # 避免重複追加聊天記錄
-            if not any(chat["question"] == user_input and chat["response"] == response for chat in st.session_state.chat_history):
+            if not any(chat["question"] == user_input and chat["response"] == response and not chat.get("is_preview") for chat in st.session_state.chat_history):
                 st.session_state.chat_history.append({
                     "question": user_input,
                     "response": response,
-                    "debug_info": debug_info if debug_info else None
+                    "debug_info": debug_info if debug_info else None,
+                    "analysis": result.get("analysis")
                 })
             
             logger.info(f"Completed processing: question={user_input}, platform={platform}, response_length={len(response)}, chat_history_length={len(st.session_state.chat_history)}")

@@ -12,13 +12,14 @@ from config import LIHKG_API, HKGOLDEN_API
 from grok3_client import call_grok3_api
 import re
 from threading import Lock
+import aiohttp
 
 logger = streamlit.logger.get_logger(__name__)
 processing_lock = Lock()
 active_requests = {}
 MAX_PROMPT_LENGTH = 30000
 THREAD_ID_CACHE_DURATION = 300
-HONG_KONG_TZ = pytz.timezone("Asia/Hong_Kong")
+HONG_KONG_TZ = pytz.timezone("Asia/Hong_KONG")
 
 def clean_expired_cache(platform):
     cache_duration = LIHKG_API["CACHE_DURATION"] if platform == "LIHKG" else HKGOLDEN_API["CACHE_DURATION"]
@@ -95,7 +96,6 @@ async def analyze_user_question(question, platform):
         elif line.startswith("篩選條件:"):
             filter_condition = line.replace("篩選條件:", "").strip()
     
-    # 改進數字解析
     if "分享" in question.lower() or "排列" in question.lower():
         match = re.search(r'(\d+)[個个]', question)
         if match:
@@ -193,7 +193,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
         for item in items:
             last_reply_time = item.get("last_reply_time", 0)
             no_of_reply = item.get("no_of_reply", 0)
-            if last_reply_time:  # 僅要求有最後回覆時間
+            if last_reply_time:
                 filtered_items.append(item)
             else:
                 logger.info(f"Filtered out thread: id={item.get('id')}, last_reply_time={last_reply_time}, no_of_reply={no_of_reply}")
@@ -316,7 +316,6 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
                 for reply in replies
             ])
     else:
-        # 若無需回覆內容，僅收集帖子元數據
         for selected_item in selected_items:
             try:
                 thread_id = selected_item["thread_id"] if platform == "LIHKG" else selected_item["id"]
@@ -430,45 +429,99 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
     api_elapsed = time.time() - start_api_time
     logger.info(f"Grok 3 API call completed: elapsed={api_elapsed:.2f}s")
     
-    if api_result.get("status") == "error":
-        logger.warning(f"Falling back to local response due to Grok 3 API failure: {api_result['content']}")
-        response = f"""
-最新帖子來自 {platform}！問題意圖：{analysis['intent']}。
-"""
-        for thread in threads_data[:analysis["num_threads"]]:
-            summary = "無回覆可總結" if not thread["replies"] else "網友討論熱烈，觀點多元化。"
-            response += f"""
-- "{thread['title'][:50]}"（{thread['no_of_reply']} 條回覆，更新至 {datetime.fromtimestamp(thread['last_reply_time'], tz=HONG_KONG_TZ).strftime('%Y-%m-%d %H:%M:%S') if thread['last_reply_time'] else '未知'}）：{summary}
-"""
-        response = response[:share_text_limit]
-        response += f"\n選擇理由：選擇這些帖子因其最新性和回覆數量多。"
-    else:
-        content = ""
-        async for chunk in api_result["content"]:
-            if chunk:
-                content += chunk
-                logger.debug(f"Received chunk: {chunk[:50]}...")
+    async def stream_response():
+        if api_result.get("status") == "error":
+            logger.warning(f"Stream failed: request_key={request_key}, error={api_result['content']}")
+            # 回退到同步模式
+            api_result_sync = await call_grok3_api(prompt, stream=False)
+            api_elapsed = time.time() - start_api_time
+            logger.info(f"Grok 3 API retry completed: elapsed={api_elapsed:.2f}s")
+            
+            if api_result_sync.get("status") == "error":
+                logger.error(f"Retry failed: request_key={request_key}, error={api_result_sync['content']}")
+                yield f"無法生成回應，API 連接失敗：{api_result_sync['content']}"
+                return
+            
+            content = api_result_sync["content"]
+            content = re.sub(r'\{\{ output \}\}|\{ output \}', '', content).strip()
+            
+            share_text = "無分享文字"
+            reason = "無選擇理由"
+            
+            share_match = re.search(r'分享文字：\s*(.*?)(?=\n選擇理由：|\Z)', content, re.DOTALL)
+            reason_match = re.search(r'選擇理由：\s*(.*)', content, re.DOTALL)
+            
+            if share_match:
+                share_text = share_match.group(1).strip()[:share_text_limit]
+                yield f"**分享文字**：{share_text}\n"
+            if reason_match:
+                reason = reason_match.group(1).strip()[:reason_limit]
+                yield f"**選擇理由**：{reason}\n"
+            return
         
-        logger.info(f"Raw API response: {content[:200]}...")
+        try:
+            share_text = []
+            reason = []
+            current_section = None
+            
+            async for chunk in api_result["content"]:
+                if chunk:
+                    logger.debug(f"Received chunk: {chunk[:50]}...")
+                    chunk = re.sub(r'\{\{ output \}\}|\{ output \}', '', chunk).strip()
+                    if not chunk:
+                        continue
+                    
+                    if "分享文字：" in chunk:
+                        current_section = "share"
+                        share_text.append(chunk.split("分享文字：")[-1].strip())
+                    elif "選擇理由：" in chunk:
+                        current_section = "reason"
+                        reason.append(chunk.split("選擇理由：")[-1].strip())
+                    elif current_section == "share":
+                        share_text.append(chunk)
+                    elif current_section == "reason":
+                        reason.append(chunk)
+                    
+                    if share_text and current_section == "share":
+                        yield f"**分享文字**：{' '.join(share_text)[:share_text_limit]}\n"
+                    if reason and current_section == "reason":
+                        yield f"**選擇理由**：{' '.join(reason)[:reason_limit]}\n"
+            
+            if share_text and not reason:
+                yield f"**分享文字**：{' '.join(share_text)[:share_text_limit]}\n"
+            if reason:
+                yield f"**選擇理由**：{' '.join(reason)[:reason_limit]}\n"
         
-        content = re.sub(r'\{\{ output \}\}|\{ output \}', '', content).strip()
-        
-        share_text = "無分享文字"
-        reason = "無選擇理由"
-        
-        share_match = re.search(r'分享文字：\s*(.*?)(?=\n選擇理由：|\Z)', content, re.DOTALL)
-        reason_match = re.search(r'選擇理由：\s*(.*)', content, re.DOTALL)
-        
-        if share_match:
-            share_text = share_match.group(1).strip()[:share_text_limit]
-        if reason_match:
-            reason = reason_match.group(1).strip()[:reason_limit]
-        
-        response = f"分享文字：{share_text}\n選擇理由：{reason}"
-        logger.info(f"Extracted response: share_text={share_text[:100]}..., reason={reason[:100]}...")
+        except (aiohttp.ClientConnectionError, aiohttp.ClientResponseError, aiohttp.ClientConnectorError, asyncio.TimeoutError) as e:
+            logger.error(f"Stream processing error: request_key={request_key}, error={str(e)}")
+            # 回退到同步模式
+            api_result_sync = await call_grok3_api(prompt, stream=False)
+            api_elapsed = time.time() - start_api_time
+            logger.info(f"Grok 3 API retry completed: elapsed={api_elapsed:.2f}s")
+            
+            if api_result_sync.get("status") == "error":
+                logger.error(f"Retry failed: request_key={request_key}, error={api_result_sync['content']}")
+                yield f"無法生成回應，API 連接失敗：{api_result_sync['content']}"
+                return
+            
+            content = api_result_sync["content"]
+            content = re.sub(r'\{\{ output \}\}|\{ output \}', '', content).strip()
+            
+            share_text = "無分享文字"
+            reason = "無選擇理由"
+            
+            share_match = re.search(r'分享文字：\s*(.*?)(?=\n選擇理由：|\Z)', content, re.DOTALL)
+            reason_match = re.search(r'選擇理由：\s*(.*)', content, re.DOTALL)
+            
+            if share_match:
+                share_text = share_match.group(1).strip()[:share_text_limit]
+                yield f"**分享文字**：{share_text}\n"
+            if reason_match:
+                reason = reason_match.group(1).strip()[:reason_limit]
+                yield f"**選擇理由**：{reason}\n"
     
     result = {
-        "response": response,
+        "response": stream_response(),
         "rate_limit_info": rate_limit_info,
         "processed_data": processed_data,
         "analysis": analysis
@@ -479,7 +532,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
         if current_time - active_requests[request_key]["timestamp"] > 30:
             del active_requests[request_key]
     
-    logger.info(f"Processed question: question={question}, platform={platform}, response_length={len(response)}, hk_time={datetime.now(HONG_KONG_TZ).strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"Processed question: question={question}, platform={platform}, hk_time={datetime.now(HONG_KONG_TZ).strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info(f"Selected {len(selected_items)} threads, total replies fetched: {sum(len(thread['replies']) for thread in threads_data)}")
     
     return result

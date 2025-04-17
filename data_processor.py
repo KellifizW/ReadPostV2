@@ -31,6 +31,15 @@ def score_item(item, current_time):
 
 async def process_user_question(question, platform, cat_id_map, selected_cat):
     """處理用戶問題並返回相關帖子數據"""
+    # 檢查重複調用
+    if "last_processed_time" in st.session_state and time.time() - st.session_state["last_processed_time"] < 1:
+        logger.warning("Skipping duplicate process_user_question call")
+        return st.session_state.get("last_result", {
+            "response": "重複請求，請稍後重試。",
+            "rate_limit_info": [],
+            "processed_data": []
+        })
+    
     logger.info(f"Starting to process question: question={question}, platform={platform}, category={selected_cat}")
     
     clean_expired_cache(platform)
@@ -156,18 +165,22 @@ This 高登討論區 post is buzzing with {selected_item["no_of_reply"]} replies
         response_text += chunk
     
     if "Error" in response_text:
-        logger.error(f"Grok 3 API error: {response_text}")
-        # 回退到本地生成
+        logger.warning(f"Falling back to local response due to Grok 3 API failure: {response_text}")
         response = f"以下是從 {platform} 的帖子（標題：{thread_title}，ID：{thread_id}）中提取的內容：\n\n"
         for i, data in enumerate(processed_data[:3], 1):
             response += f"回覆 {i}：{data['content']}\n讚好：{data['like_count']}，點踩：{data['dislike_count']}\n\n"
     else:
         response = response_text.strip()
     
-    logger.info(f"Processed question: question={question}, platform={platform}, response_length={len(response)}")
-    
-    return {
+    # 記錄結果和時間
+    result = {
         "response": response,
         "rate_limit_info": rate_limit_info,
         "processed_data": processed_data
     }
+    st.session_state["last_processed_time"] = time.time()
+    st.session_state["last_result"] = result
+    
+    logger.info(f"Processed question: question={question}, platform={platform}, response_length={len(response)}")
+    
+    return result

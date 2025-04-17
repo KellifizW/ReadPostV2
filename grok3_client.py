@@ -1,3 +1,4 @@
+```python
 import streamlit as st
 import streamlit.logger
 import aiohttp
@@ -144,6 +145,7 @@ async def stream_grok3_response(prompt: str) -> AsyncGenerator[dict, None]:
                     if line:
                         try:
                             decoded_line = line.decode('utf-8').strip()
+                            logger.debug(f"Streaming data: {decoded_line[:100]}")
                             if decoded_line.startswith("data: "):
                                 json_data = json.loads(decoded_line[6:])
                                 if "choices" in json_data and json_data["choices"]:
@@ -165,3 +167,4 @@ async def stream_grok3_response(prompt: str) -> AsyncGenerator[dict, None]:
             yield {"content": f"Error: API unexpected error - {str(e)}", "status": "error"}
         finally:
             await retry_client.close()
+```

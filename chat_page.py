@@ -114,4 +114,36 @@ async def chat_page():
                     if result.get("rate_limit_info"):
                         debug_info.append("- 速率限制或錯誤記錄：")
                         debug_info.extend(f"  - {info}" for info in result["rate_limit_info"])
-                    error_message = f"處理
+                    error_message = f"處理失敗，原因：{str(e)}。請稍後重試或檢查 API 配置。"
+                    placeholder.markdown(error_message)
+                    st.session_state.chat_history.append({
+                        "question": user_input,
+                        "response": error_message,
+                        "debug_info": debug_info
+                    })
+                    logger.error(f"Processing failed: question={user_input}, platform={platform}, error={str(e)}")
+                    st.session_state.input_processed = False
+                    return
+            
+            response = result.get("response", "無回應內容")
+            placeholder.markdown(response)
+            
+            if result.get("rate_limit_info"):
+                debug_info.append("#### 調試信息：")
+                debug_info.append("- 速率限制或錯誤記錄：")
+                debug_info.extend(f"  - {info}" for info in result["rate_limit_info"])
+            
+            # 避免重複追加聊天記錄
+            if not any(chat["question"] == user_input and chat["response"] == response for chat in st.session_state.chat_history):
+                st.session_state.chat_history.append({
+                    "question": user_input,
+                    "response": response,
+                    "debug_info": debug_info if debug_info else None
+                })
+            
+            logger.info(f"Completed processing: question={user_input}, platform={platform}, response_length={len(response)}, chat_history_length={len(st.session_state.chat_history)}")
+            st.session_state.input_processed = False
+    
+    # 重置輸入狀態（在每次渲染結束後）
+    if not user_input:
+        st.session_state.input_processed = False

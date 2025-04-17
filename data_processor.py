@@ -9,6 +9,7 @@ import random
 from datetime import datetime
 from config import LIHKG_API, HKGOLDEN_API
 from grok3_client import stream_grok3_response
+import re
 
 logger = streamlit.logger.get_logger(__name__)
 
@@ -25,14 +26,23 @@ def score_item(item, current_time):
     no_of_reply = item["no_of_reply"]
     rt = item["rt"]
     lrt = item["lrt"]
-    # 加權：回覆數(40%) + 評分(40%) - 時間差(20%)
     score = (0.4 * no_of_reply / 100) + (0.4 * rt / 10) - (0.2 * (current_time - lrt) / 3600)
     return score
 
+def clean_reply_text(text):
+    """清理回覆中的 HTML 標籤，保留純文字"""
+    text = re.sub(r'<img[^>]+alt="\[([^\]]+)\]"[^>]*>', r'[\1]', text)
+    text = clean_html(text)
+    text = ' '.join(text.split())
+    return text
+
 async def process_user_question(question, platform, cat_id_map, selected_cat):
     """處理用戶問題並返回相關帖子數據"""
-    # 檢查重複調用
-    if "last_processed_time" in st.session_state and time.time() - st.session_state["last_processed_time"] < 1:
+    request_key = f"{question}:{platform}:{selected_cat}"
+    current_time = time.time()
+    if ("last_request_key" in st.session_state and 
+        st.session_state["last_request_key"] == request_key and 
+        current_time - st.session_state.get("last_processed_time", 0) < 5):
         logger.warning("Skipping duplicate process_user_question call")
         return st.session_state.get("last_result", {
             "response": "重複請求，請稍後重試。",
@@ -84,7 +94,6 @@ async def process_user_question(question, platform, cat_id_map, selected_cat):
             "processed_data": []
         }
     
-    # 確保至少 3 條非空回覆
     valid_items = [
         item for item in filtered_items
         if len([r for r in item["replies"] if r["msg"].strip()]) >= 3
@@ -98,7 +107,6 @@ async def process_user_question(question, platform, cat_id_map, selected_cat):
             "processed_data": []
         }
     
-    # 加權選擇最佳帖子
     current_time = time.time()
     scored_items = [(item, score_item(item, current_time)) for item in valid_items]
     selected_item = max(scored_items, key=lambda x: x[1])[0]
@@ -122,7 +130,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat):
         {
             "thread_id": thread_id,
             "title": thread_title,
-            "content": clean_html(reply["msg"]),
+            "content": clean_reply_text(reply["msg"]),
             "like_count": reply.get("like_count", 0),
             "dislike_count": reply.get("dislike_count", 0)
         }
@@ -137,7 +145,8 @@ async def process_user_question(question, platform, cat_id_map, selected_cat):
             "processed_data": []
         }
     
-    # 硬編碼 Grok 3 prompt
+    # 恢復原始 prompt 結構，清理 HTML
+    cleaned_replies = [clean_reply_text(r["msg"])[:100] + '...' if len(clean_reply_text(r["msg"])) > 100 else clean_reply_text(r["msg"]) for r in replies[:3]]
     prompt = f"""
 You are Grok, embodying the collective voice of 高登討論區. Your role is to share a post that is highly engaging, insightful, or representative of the platform's discussions. Below is a selected post from the 聊天 category, chosen for its high reply count ({selected_item["no_of_reply"]}), strong rating ({selected_item["rt"]}), and recent activity (last reply: {datetime.fromtimestamp(selected_item["lrt"]).strftime('%Y-%m-%d %H:%M:%S')}).
 
@@ -147,19 +156,18 @@ Post data:
 - Number of replies: {selected_item["no_of_reply"]}
 - Rating: {selected_item["rt"]}
 - Last reply time: {datetime.fromtimestamp(selected_item["lrt"]).strftime('%Y-%m-%d %H:%M:%S')}
-- Replies: {', '.join([r["msg"][:100] + '...' if len(r["msg"]) > 100 else r["msg"] for r in replies[:3]])}
+- Replies: {', '.join(cleaned_replies)}
 
 Generate a concise sharing text (max 280 characters) that highlights why this post is worth sharing, includes the post's title, reply count, rating, and a snippet of the first meaningful reply. Explain why you chose it (e.g., high engagement, insightful replies).
 
 Example:
-This 高登討論區 post is buzzing with {selected_item["no_of_reply"]} replies and a {selected_item["rt"]} rating! "{thread_title[:50]}" sparks debate. First reply: "{replies[0]["msg"][:50]}". Chosen for its lively discussion!
+This 高登討論區 post is buzzing with {selected_item["no_of_reply"]} replies and a {selected_item["rt"]} rating! "{thread_title[:50]}" sparks debate. First reply: "{cleaned_replies[0][:50]}". Chosen for its lively discussion!
 
-{'{{ output }}' if replies else 'No engaging posts found with meaningful replies.'}
+{{ output }}
 """
     
-    logger.info(f"Generated Grok 3 prompt: {prompt}")
+    logger.info(f"Generated Grok 3 prompt (length={len(prompt)} chars)")
     
-    # 調用 Grok 3 API
     response_text = ""
     async for chunk in stream_grok3_response(prompt):
         response_text += chunk
@@ -172,13 +180,13 @@ This 高登討論區 post is buzzing with {selected_item["no_of_reply"]} replies
     else:
         response = response_text.strip()
     
-    # 記錄結果和時間
     result = {
         "response": response,
         "rate_limit_info": rate_limit_info,
         "processed_data": processed_data
     }
-    st.session_state["last_processed_time"] = time.time()
+    st.session_state["last_request_key"] = request_key
+    st.session_state["last_processed_time"] = current_time
     st.session_state["last_result"] = result
     
     logger.info(f"Processed question: question={question}, platform={platform}, response_length={len(response)}")

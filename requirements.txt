@@ -1,0 +1,4 @@
+requests
+aiohttp
+nest_asyncio
+pytz

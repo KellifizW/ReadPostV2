@@ -25,7 +25,7 @@ def clean_expired_cache(platform):
 
 def clean_reply_text(text):
     """清理回覆中的 HTML 標籤，保留純文字"""
-    text = re.sub(r'<img[^>]+alt="$$ ([^ $$]+)\]"[^>]*>', r'[\1]', text)
+    text = re.sub(r'<img[^>]+alt="\[([^\]]+)\]"[^>]*>', r'[\1]', text)
     text = clean_html(text)
     text = ' '.join(text.split())
     return text
@@ -90,18 +90,15 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
             "processed_data": []
         }
     
-    # 過濾掉無回覆的帖子，選擇有回覆的帖子
+    # 優先選擇有回覆的帖子，若無則選擇任意帖子
     items_with_replies = [item for item in items if item.get("no_of_reply", 0) > 0]
-    if not items_with_replies:
-        logger.error("No items with replies found")
-        return {
-            "response": f"無符合條件的帖子（所有帖子均無回覆）。請檢查分類（{selected_cat}）或稍後重試。",
-            "rate_limit_info": rate_limit_info,
-            "processed_data": []
-        }
+    logger.info(f"Found {len(items_with_replies)} items with replies out of {len(items)} total items")
     
-    # 隨機選擇一個有回覆的帖子
-    selected_item = random.choice(items_with_replies)
+    if items_with_replies:
+        selected_item = random.choice(items_with_replies)
+    else:
+        logger.warning("No items with replies found, selecting a post without replies")
+        selected_item = random.choice(items)
     
     try:
         thread_id = selected_item["thread_id"] if platform == "LIHKG" else selected_item["id"]
@@ -114,6 +111,8 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
         }
     
     thread_title = selected_item["title"]
+    no_of_reply = selected_item.get("no_of_reply", 0)
+    logger.info(f"Selected thread: thread_id={thread_id}, title={thread_title}, no_of_reply={no_of_reply}")
     
     # 抓取帖子回覆內容
     logger.info(f"Fetching thread content: thread_id={thread_id}, platform={platform}")
@@ -140,7 +139,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
     st.session_state.request_counter = thread_result["request_counter"]
     st.session_state.rate_limit_until = thread_result["rate_limit_until"]
     
-    logger.info(f"Selected thread: thread_id={thread_id}, title={thread_title}, replies={len(replies)}")
+    logger.info(f"Thread content fetched: thread_id={thread_id}, title={thread_title}, replies={len(replies)}")
     
     processed_data = [
         {
@@ -153,21 +152,6 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
         for reply in replies
     ]
     
-    if not replies:
-        logger.warning(f"No valid replies for thread_id={thread_id}")
-        response = f"""
-Hot thread on {platform}! "{thread_title[:50]}" sparks discussion.
-
-Details:
-- ID: {thread_id}
-- Title: {thread_title}
-"""
-        return {
-            "response": response,
-            "rate_limit_info": rate_limit_info,
-            "processed_data": []
-        }
-    
     cleaned_replies = [clean_reply_text(r["msg"])[:100] + '...' if len(clean_reply_text(r["msg"])) > 100 else clean_reply_text(r["msg"]) for r in replies[:3]]
     prompt = f"""
 You are Grok, sharing a notable post from {platform} ({selected_cat} category). Below is a selected post chosen for its relevance.
@@ -175,7 +159,7 @@ You are Grok, sharing a notable post from {platform} ({selected_cat} category). 
 Post data:
 - ID: {thread_id}
 - Title: {thread_title}
-- Replies: {', '.join(cleaned_replies) if cleaned_replies else 'No replies'}
+- Replies: {', '.join(cleaned_replies) if cleaned_replies else 'No replies yet'}
 
 Generate a concise sharing text (max 280 characters) highlighting why this post is engaging, including the title and a snippet of the first reply if available.
 

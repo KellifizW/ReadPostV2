@@ -265,24 +265,33 @@ async def chat_page():
                 else:
                     # 使用 st.write_stream 處理異步生成器
                     full_response = []
+                    chunk_count = 0
                     try:
                         # 定義同步生成器，迭代異步生成器
                         def sync_generator():
+                            nonlocal chunk_count
                             loop = asyncio.get_running_loop()
                             iterator = response.__aiter__()
                             while True:
                                 try:
                                     chunk = loop.run_until_complete(iterator.__anext__())
+                                    chunk_count += 1
+                                    logger.debug(f"Stream chunk {chunk_count}: content={chunk}")
                                     if isinstance(chunk, str):
                                         yield chunk
                                     else:
                                         logger.warning(f"Non-string chunk received: {chunk}")
                                         yield str(chunk)
                                 except StopAsyncIteration:
+                                    logger.debug(f"Stream completed: total_chunks={chunk_count}")
                                     break
                                 except Exception as e:
                                     error_msg = f"無法生成回應，API 連接失敗：{str(e)}。請稍後重試。\n"
-                                    logger.error(f"Stream error in sync_generator: error={str(e)}, traceback={traceback.format_exc()}")
+                                    logger.error(
+                                        f"Stream error in sync_generator: error={str(e)}, "
+                                        f"chunk_count={chunk_count}, request_id={result.get('request_id', 'unknown')}, "
+                                        f"traceback={traceback.format_exc()}"
+                                    )
                                     yield error_msg
                                     break
                         
@@ -292,23 +301,41 @@ async def chat_page():
                             full_response.append(response_text)
                         elif isinstance(response_text, list):
                             full_response.extend(response_text)
+                        elif response_text is None:
+                            logger.warning("st.write_stream returned None")
+                            full_response.append("無回應內容，請稍後重試。")
                         
                         # 確保非空回應
                         response_text = "".join(str(item) for item in full_response) if full_response else "無回應內容，請稍後重試。"
+                        logger.info(
+                            f"Stream processing completed: question={user_input}, platform={platform}, "
+                            f"total_chunks={chunk_count}, response_length={len(response_text)}"
+                        )
                         placeholder.markdown(response_text)
                     except Exception as e:
-                        debug_info.append(f"#### 調試信息：\n- 流式處理錯誤: 原因={str(e)}\n- 堆棧跟踪: {traceback.format_exc()}")
+                        debug_info.append(
+                            f"#### 調試信息：\n- 流式處理錯誤: 原因={str(e)}\n"
+                            f"- 塊計數: {chunk_count}\n- 堆棧跟踪: {traceback.format_exc()}"
+                        )
                         error_message = f"無法生成回應，API 連接失敗：{str(e)}。請稍後重試。"
                         full_response.append(error_message)
                         response_text = error_message
                         placeholder.markdown(response_text)
-                        logger.error(f"Stream processing error: error={str(e)}, traceback={traceback.format_exc()}")
+                        logger.error(
+                            f"Stream processing error: error={str(e)}, chunk_count={chunk_count}, "
+                            f"request_id={result.get('request_id', 'unknown')}, traceback={traceback.format_exc()}"
+                        )
             except Exception as e:
-                debug_info.append(f"#### 調試信息：\n- 處理錯誤: 原因={str(e)}\n- 堆棧跟踪: {traceback.format_exc()}")
+                debug_info.append(
+                    f"#### 調試信息：\n- 處理錯誤: 原因={str(e)}\n- 堆棧跟踪: {traceback.format_exc()}"
+                )
                 error_message = f"無法生成回應，處理失敗：{str(e)}。請檢查問題格式或稍後重試。"
                 response_text = error_message
                 placeholder.markdown(error_message)
-                logger.error(f"General processing error: error={str(e)}, traceback={traceback.format_exc()}")
+                logger.error(
+                    f"General processing error: error={str(e)}, request_id={result.get('request_id', 'unknown')}, "
+                    f"traceback={traceback.format_exc()}"
+                )
             
             if result.get("rate_limit_info"):
                 debug_info.append("#### 調試信息：")

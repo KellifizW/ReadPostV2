@@ -6,8 +6,12 @@ import streamlit as st
 import streamlit.logger
 import time
 import random
+from config import LIHKG_API, HKGOLDEN_API
 
 logger = streamlit.logger.get_logger(__name__)
+
+# 確認 HKGOLDEN_API 是否正確加載
+logger.info(f"HKGOLDEN_API loaded: {HKGOLDEN_API}")
 
 def clean_expired_cache(platform):
     """清理過期緩存"""

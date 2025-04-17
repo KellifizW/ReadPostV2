@@ -65,42 +65,61 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, mi
     all_items = []
     rate_limit_info = []
     
-    # 多頁抓取並合併
-    for page in range(1, HKGOLDEN_API["MAX_PAGES"] + 1):
-        logger.info(f"Fetching cat_id={cat_id}, page={page}")
-        if platform == "LIHKG":
-            result = await get_lihkg_topic_list(
-                cat_id=cat_id,
-                sub_cat_id=0,
-                start_page=page,
-                max_pages=1,
-                request_counter=st.session_state.get("request_counter", 0),
-                last_reset=st.session_state.get("last_reset", time.time()),
-                rate_limit_until=st.session_state.get("rate_limit_until", 0)
-            )
-        else:
-            result = await get_hkgolden_topic_list(
-                cat_id=cat_id,
-                sub_cat_id=0,
-                start_page=page,
-                max_pages=1,
-                request_counter=st.session_state.get("request_counter", 0),
-                last_reset=st.session_state.get("last_reset", time.time()),
-                rate_limit_until=st.session_state.get("rate_limit_until", 0)
-            )
+    try:
+        # 記錄 API 配置
+        logger.debug(f"Platform={platform}, API config: {HKGOLDEN_API if platform == '高登討論區' else LIHKG_API}")
         
-        items = result["items"]
-        rate_limit_info.extend(result["rate_limit_info"])
-        st.session_state.request_counter = result["request_counter"]
-        st.session_state.last_reset = result["last_reset"]
-        st.session_state.rate_limit_until = result["rate_limit_until"]
-        
-        logger.info(f"Fetched {len(items)} items for cat_id={cat_id}, page={page}")
-        all_items.extend(items)
-        
-        # 記錄每個帖子的 no_of_reply
-        for item in items:
-            logger.debug(f"Item: id={item.get('id')}, no_of_reply={item.get('no_of_reply')}, replies_count={len(item.get('replies', []))}")
+        # 多頁抓取並合併
+        for page in range(1, HKGOLDEN_API["MAX_PAGES"] + 1):
+            logger.info(f"Fetching cat_id={cat_id}, page={page}")
+            if platform == "LIHKG":
+                result = await get_lihkg_topic_list(
+                    cat_id=cat_id,
+                    sub_cat_id=0,
+                    start_page=page,
+                    max_pages=1,
+                    request_counter=st.session_state.get("request_counter", 0),
+                    last_reset=st.session_state.get("last_reset", time.time()),
+                    rate_limit_until=st.session_state.get("rate_limit_until", 0)
+                )
+            else:
+                result = await get_hkgolden_topic_list(
+                    cat_id=cat_id,
+                    sub_cat_id=0,
+                    start_page=page,
+                    max_pages=1,
+                    request_counter=st.session_state.get("request_counter", 0),
+                    last_reset=st.session_state.get("last_reset", time.time()),
+                    rate_limit_until=st.session_state.get("rate_limit_until", 0)
+                )
+            
+            items = result["items"]
+            rate_limit_info.extend(result["rate_limit_info"])
+            st.session_state.request_counter = result["request_counter"]
+            st.session_state.last_reset = result["last_reset"]
+            st.session_state.rate_limit_until = result["rate_limit_until"]
+            
+            logger.info(f"Fetched {len(items)} items for cat_id={cat_id}, page={page}")
+            all_items.extend(items)
+            
+            # 記錄每個帖子的 no_of_reply
+            for item in items:
+                logger.debug(f"Item: id={item.get('id')}, no_of_reply={item.get('no_of_reply')}, replies_count={len(item.get('replies', []))}")
+    
+    except KeyError as e:
+        logger.error(f"Configuration error in API fetch: {str(e)}")
+        return {
+            "response": f"系統配置錯誤：缺少 {str(e)}。請聯繫管理員。",
+            "rate_limit_info": rate_limit_info,
+            "processed_data": []
+        }
+    except Exception as e:
+        logger.error(f"Unexpected error in API fetch: {str(e)}")
+        return {
+            "response": f"抓取帖子失敗：{str(e)}。請稍後重試。",
+            "rate_limit_info": rate_limit_info,
+            "processed_data": []
+        }
     
     fetch_elapsed = time.time() - start_fetch_time
     logger.info(f"Fetch completed: platform={platform}, category={selected_cat}, total_items={len(all_items)}, elapsed={fetch_elapsed:.2f}s")
@@ -226,20 +245,4 @@ Details:
 - Title: {thread_title}
 """
         for i, data in enumerate(processed_data[:2], 1):
-            response += f"\n回覆 {i}：{data['content'][:50]}...\n讚好：{data['like_count']}，點踩：{data['dislike_count']}\n"
-    else:
-        response = api_result["content"].strip()
-    
-    result = {
-        "response": response,
-        "rate_limit_info": rate_limit_info,
-        "processed_data": processed_data
-    }
-    with processing_lock:
-        st.session_state["last_request_key"] = request_key
-        st.session_state["last_processed_time"] = current_time
-        st.session_state["last_result"] = result
-    
-    logger.info(f"Processed question: question={question}, platform={platform}, response_length={len(response)}")
-    
-    return result
+            response += f"\n回覆 {i}：{data['content'][:50]}...\n讚好：{data['like_count']}，

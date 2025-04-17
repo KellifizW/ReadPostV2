@@ -9,8 +9,8 @@ from config import GROK3_API
 
 logger = streamlit.logger.get_logger(__name__)
 
-async def call_grok3_api(prompt, stream=False):
-    """調用Grok 3 API，支持同步和流式回應，確保單次請求並記錄詳細日誌"""
+async def call_grok3_api(prompt, stream=False, max_retries=3, retry_delay=5):
+    """調用Grok 3 API，支持同步和流式回應，帶重試邏輯"""
     request_id = str(uuid.uuid4())
     logger.info(f"Preparing Grok 3 API request: request_id={request_id}, prompt_length={len(prompt)}, stream={stream}")
     
@@ -36,14 +36,13 @@ async def call_grok3_api(prompt, stream=False):
         "stream": stream
     }
     
-    async with aiohttp.ClientSession() as session:
-        try:
-            logger.info(f"Sending Grok 3 API request: request_id={request_id}, url={GROK3_API['BASE_URL']}/chat/completions, stream={stream}")
+    async def try_request():
+        async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"{GROK3_API['BASE_URL']}/chat/completions",
                 headers=headers,
                 json=payload,
-                timeout=120
+                timeout=180  # 延長超時
             ) as response:
                 if response.status != 200:
                     response_text = await response.text()
@@ -83,10 +82,19 @@ async def call_grok3_api(prompt, stream=False):
                     content = data.get("choices", [{}])[0].get("message", {}).get("content", "No content")
                     logger.info(f"Grok 3 API succeeded: request_id={request_id}, content_length={len(content)}")
                     return {"status": "success", "content": content}
-        
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Attempt {attempt + 1}/{max_retries}: request_id={request_id}")
+            result = await try_request()
+            return result
         except (aiohttp.ClientConnectionError, aiohttp.ClientResponseError, aiohttp.ClientConnectorError, asyncio.TimeoutError) as e:
-            logger.error(f"Grok 3 API connection error: request_id={request_id}, error={str(e)}")
-            return {"status": "error", "content": f"Connection error: {str(e)}"}
+            logger.warning(f"Attempt {attempt + 1}/{max_retries} failed: request_id={request_id}, error={str(e)}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(retry_delay)
+                continue
+            logger.error(f"All retries failed: request_id={request_id}, error={str(e)}")
+            return {"status": "error", "content": f"Connection error after {max_retries} retries: {str(e)}"}
         except Exception as e:
             logger.error(f"Grok 3 API error: request_id={request_id}, error={str(e)}")
             return {"status": "error", "content": str(e)}

@@ -1,54 +1,40 @@
+# config.py
+GENERAL = {
+    "TIMEZONE": "Asia/Hong_Kong"
+}
+
 LIHKG_API = {
     "BASE_URL": "https://lihkg.com",
-    "MIN_REPLIES": 125,
-    "MAX_REPLIES_PER_THREAD": 3,
-    "BATCH_SIZE": 3,
-    "MAX_PAGES": 1,
-    "CACHE_DURATION": 60,  # 秒
-    "RATE_LIMIT": {
-        "MAX_REQUESTS": 20,
-        "PERIOD": 60
-    },
-    "REQUEST_DELAY": 5,
     "CATEGORIES": {
-        "吹水台": 1,
-        "熱門台": 2,
-        "時事台": 5,
-        "上班台": 14,
-        "財經台": 15,
-        "成人台": 29,
-        "創意台": 31
+        "最新": 1,
+        "熱門": 2,
+        "吹水": 11,
+        "時事": 31
+    },
+    "MAX_PAGES": 3,
+    "MIN_REPLIES": 50,
+    "CACHE_DURATION": 60,
+    "REQUEST_DELAY": 0.5,
+    "RATE_LIMIT": {
+        "MAX_REQUESTS": 30,
+        "PERIOD": 60
     }
 }
 
 HKGOLDEN_API = {
     "BASE_URL": "https://api.hkgolden.com",
-    "MIN_REPLIES": 50,
-    "MAX_REPLIES_PER_THREAD": 3,
-    "BATCH_SIZE": 3,
-    "MAX_PAGES": 1,
-    "CACHE_DURATION": 60,  # 秒
-    "RATE_LIMIT": {
-        "MAX_REQUESTS": 20,
-        "PERIOD": 60
-    },
-    "REQUEST_DELAY": 5,
     "CATEGORIES": {
-        "聊天": "HT"
+        "聊天": "CA",
+        "時事": "NW",
+        "娛樂": "ET",
+        "科技": "IT"
+    },
+    "MAX_PAGES": 3,
+    "MIN_REPLIES": 50,
+    "CACHE_DURATION": 60,
+    "REQUEST_DELAY": 0.5,
+    "RATE_LIMIT": {
+        "MAX_REQUESTS": 30,
+        "PERIOD": 60
     }
-}
-
-GROK3_API = {
-    "URL": "https://api.x.ai/v1/chat/completions",
-    "TOKEN_LIMIT": 8000,
-    "MODEL": "grok-3-beta",
-    "MAX_TOKENS": 600,
-    "TEMPERATURE": 0.7,
-    "RETRIES": 3,
-    "TIMEOUT": 60
-}
-
-GENERAL = {
-    "TIMEZONE": "Asia/Hong_Kong",
-    "LOG_LEVEL": "INFO"
 }

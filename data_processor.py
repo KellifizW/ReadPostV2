@@ -1,3 +1,4 @@
+```python
 import asyncio
 from lihkg_api import get_lihkg_topic_list, get_lihkg_thread_content
 from hkgolden_api import get_hkgolden_topic_list, get_hkgolden_thread_content
@@ -30,8 +31,8 @@ def clean_reply_text(text):
     text = ' '.join(text.split())
     return text
 
-async def process_user_question(question, platform, cat_id_map, selected_cat):
-    """處理用戶問題並返回相關帖子數據"""
+async def process_user_question(question, platform, cat_id_map, selected_cat, return_prompt=False):
+    """處理用戶問題並返回相關帖子數據或原始 prompt"""
     request_key = f"{question}:{platform}:{selected_cat}"
     current_time = time.time()
     
@@ -185,7 +186,14 @@ Hot {platform} post! "{thread_title[:50]}" sparks debate. First reply: "{cleaned
 {{ output }}
 """
     
-    logger.info(f"Generated Grok 3 prompt (length={len(prompt)} chars)")
+    logger.info(f"Generated prompt (length={len(prompt)} chars)")
+    
+    if return_prompt:
+        return {
+            "response": prompt,
+            "rate_limit_info": rate_limit_info,
+            "processed_data": processed_data
+        }
     
     start_api_time = time.time()
     api_result = await call_grok3_api(prompt)
@@ -220,3 +228,4 @@ Details:
     logger.info(f"Processed question: question={question}, platform={platform}, response_length={len(response)}")
     
     return result
+```

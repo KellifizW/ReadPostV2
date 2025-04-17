@@ -38,3 +38,14 @@ HKGOLDEN_API = {
         "PERIOD": 60
     }
 }
+
+GROK3_API = {
+    "BASE_URL": "https://api.x.ai/v1",
+    "API_KEY": "YOUR_GROK3_API_KEY",  # 替換為真實的 xAI Grok 3 API 密鑰
+    "MODEL": "grok-3",
+    "MAX_TOKENS": 4096,
+    "RATE_LIMIT": {
+        "MAX_REQUESTS": 100,
+        "PERIOD": 3600
+    }
+}

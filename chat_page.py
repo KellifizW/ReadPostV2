@@ -2,360 +2,273 @@ import streamlit as st
 import asyncio
 from datetime import datetime
 import pytz
-import re
 from data_processor import process_user_question
+from grok3_client import stream_grok3_response
 import time
 import traceback
-from config import LIHKG_API, HKGOLDEN_API, GENERAL
-import streamlit.logger
 
-logger = streamlit.logger.get_logger(__name__)
 HONG_KONG_TZ = pytz.timezone("Asia/Hong_Kong")
+logger = st.logger.get_logger(__name__)
 
 async def chat_page():
-    st.title("討論區聊天介面")
+    st.title("LIHKG 聊天介面")
     
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
+    if "topic_list_cache" not in st.session_state:
+        st.session_state.topic_list_cache = {}
     if "rate_limit_until" not in st.session_state:
         st.session_state.rate_limit_until = 0
     if "request_counter" not in st.session_state:
         st.session_state.request_counter = 0
     if "last_reset" not in st.session_state:
         st.session_state.last_reset = time.time()
-    if "thread_content_cache" not in st.session_state:
-        st.session_state.thread_content_cache = {}
-    if "last_submit_key" not in st.session_state:
-        st.session_state.last_submit_key = None
-    if "last_submit_time" not in st.session_state:
-        st.session_state.last_submit_time = 0
-    if "processing_request" not in st.session_state:
-        st.session_state.processing_request = False
-
-    if time.time() < st.session_state.rate_limit_until:
-        st.error(f"API 速率限制中，請在 {datetime.fromtimestamp(st.session_state.rate_limit_until, tz=HONG_KONG_TZ).strftime('%Y-%m-%d %H:%M:%S')} 後重試。")
-        return
     
-    platform = st.selectbox("選擇討論區平台", ["LIHKG", "高登討論區"], index=0)
-    if platform == "LIHKG":
-        categories = LIHKG_API["CATEGORIES"]
-    else:
-        categories = HKGOLDEN_API["CATEGORIES"]
+    cat_id_map = {
+        "吹水台": 1,
+        "熱門台": 2,
+        "時事台": 5,
+        "上班台": 14,
+        "財經台": 15,
+        "成人台": 29,
+        "創意台": 31
+    }
     
-    selected_cat = st.selectbox("選擇分類", options=list(categories.keys()), index=0)
+    selected_cat = st.selectbox("選擇分類", options=list(cat_id_map.keys()), index=0)
     
-    st.markdown("### 聊天記錄")
+    st.markdown("#### 速率限制狀態")
+    st.markdown(f"- 當前請求計數: {st.session_state.request_counter}")
+    st.markdown(f"- 最後重置時間: {datetime.fromtimestamp(st.session_state.last_reset, tz=HONG_KONG_TZ).strftime('%Y-%m-%d %H:%M:%S')}")
+    st.markdown(
+        f"- 速率限制解除時間: "
+        f"{datetime.fromtimestamp(st.session_state.rate_limit_until, tz=HONG_KONG_TZ).strftime('%Y-%m-%d %H:%M:%S') if st.session_state.rate_limit_until > time.time() else '無限制'}"
+    )
+    
     for chat in st.session_state.chat_history:
         with st.chat_message("user"):
-            st.markdown(f"**用戶**：{chat['question']}")
+            st.markdown(chat["question"])
         with st.chat_message("assistant"):
-            if chat.get("is_preview"):
-                st.markdown("**提示預覽**：")
-                st.code(chat['response'], language="text")
-            else:
-                response = chat['response']
-                if isinstance(response, str):
-                    response = response.strip()
-                    response = re.sub(r'\{\{ output \}\}|\{ output \}', '', response).strip()
-                    
-                    share_text = "無分享文字"
-                    reason = "無選擇理由"
-                    
-                    share_match = re.search(r'分享文字：\s*(.*?)(?=\n*選擇理由：|\Z)', response, re.DOTALL)
-                    reason_match = re.search(r'選擇理由：\s*(.*)', response, re.DOTALL)
-                    
-                    if share_match:
-                        share_text = share_match.group(1).strip()
-                    if reason_match:
-                        reason = reason_match.group(1).strip()
-                    
-                    if share_text != "無分享文字":
-                        st.markdown(f"**分享文字**：{share_text}")
-                    if reason != "無選擇理由":
-                        st.markdown(f"**選擇理由**：{reason}")
-                else:
-                    st.write(response)
-            
-            if chat.get("debug_info") or chat.get("analysis"):
-                with st.expander("調試信息"):
-                    if chat.get("analysis"):
-                        analysis = chat["analysis"]
-                        st.markdown("#### 問題分析：")
-                        st.markdown(f"- 意圖：{analysis['intent']}")
-                        st.markdown(f"- 數據類型：{', '.join(analysis['data_types'])}")
-                        st.markdown(f"- 帖子數量：{analysis['num_threads']}")
-                        st.markdown(f"- 回覆策略：{analysis['reply_strategy']}")
-                        st.markdown(f"- 篩選條件：{analysis['filter_condition']}")
-                    if chat.get("debug_info"):
-                        for info in chat["debug_info"]:
-                            st.markdown(info)
+            st.markdown(chat["answer"])
     
-    user_input = st.chat_input("輸入你的問題或要求（例如：分享任何帖文）", key="chat_page_chat_input")
-    preview_button = st.button("預覽", key="preview_button")
-
-    if st.session_state.processing_request:
-        st.warning("正在處理請求，請稍候。")
-        return
-
-    if preview_button and user_input:
-        logger.info(f"Preview button clicked: question={user_input}, platform={platform}, category={selected_cat}")
-        
-        submit_key = f"preview:{user_input}:{platform}:{selected_cat}"
-        current_time = time.time()
-        if (st.session_state.last_submit_key == submit_key and 
-            current_time - st.session_state.last_submit_time < 5):
-            logger.warning("Skipping duplicate preview submission")
-            st.warning("請勿重複提交相同預覽請求，請稍後再試。")
-            return
-        
-        st.session_state.processing_request = True
-        st.session_state.last_submit_key = submit_key
-        st.session_state.last_submit_time = current_time
-
-        with st.chat_message("user"):
-            st.markdown(f"**用戶**：{user_input}")
-        
-        with st.chat_message("assistant"):
-            placeholder = st.empty()
-            debug_info = []
-            
-            cache_key = f"{platform}_{selected_cat}_{user_input}"
-            use_cache = cache_key in st.session_state.thread_content_cache and \
-                        time.time() - st.session_state.thread_content_cache[cache_key]["timestamp"] < \
-                        (LIHKG_API["CACHE_DURATION"] if platform == "LIHKG" else HKGOLDEN_API["CACHE_DURATION"])
-            
-            if use_cache:
-                logger.info(f"Using cache for preview: platform={platform}, category={selected_cat}, question={user_input}")
-                result = st.session_state.thread_content_cache[cache_key]["data"]
-            else:
-                try:
-                    logger.info(f"Calling process_user_question for preview: question={user_input}, platform={platform}, category={selected_cat}")
-                    result = await process_user_question(
-                        user_input,
-                        platform=platform,
-                        cat_id_map=categories,
-                        selected_cat=selected_cat,
-                        return_prompt=True
-                    )
-                    st.session_state.thread_content_cache[cache_key] = {
-                        "data": result,
-                        "timestamp": time.time()
-                    }
-                except Exception as e:
-                    debug_info = [f"#### 調試信息：\n- 處理錯誤: 原因={str(e)}\n- 堆棧跟踪: {traceback.format_exc()}"]
-                    error_message = f"生成提示失敗，原因：{str(e)}。請檢查問題格式或稍後重試。"
-                    placeholder.markdown(error_message)
-                    st.session_state.chat_history.append({
-                        "question": user_input,
-                        "response": error_message,
-                        "debug_info": debug_info,
-                        "is_preview": True,
-                        "timestamp": current_time
-                    })
-                    logger.error(f"Preview failed: question={user_input}, platform={platform}, error={str(e)}, traceback={traceback.format_exc()}")
-                    st.session_state.processing_request = False
-                    return
-            
-            prompt = result.get("response", "無提示內容")
-            placeholder.markdown("**提示預覽**：")
-            placeholder.code(prompt, language="text")
-            
-            if result.get("rate_limit_info"):
-                debug_info.append("#### 調試信息：")
-                debug_info.append("- 速率限制或錯誤記錄：")
-                debug_info.extend(f"  - {info}" for info in result["rate_limit_info"])
-            
-            if not any(
-                chat["question"] == user_input and 
-                chat["response"] == prompt and 
-                chat.get("is_preview") and 
-                abs(chat["timestamp"] - current_time) < 1
-                for chat in st.session_state.chat_history
-            ):
-                st.session_state.chat_history.append({
-                    "question": user_input,
-                    "response": prompt,
-                    "debug_info": debug_info if debug_info else None,
-                    "analysis": result.get("analysis"),
-                    "is_preview": True,
-                    "timestamp": current_time
-                })
-            
-            logger.info(f"Completed preview: question={user_input}, platform={platform}, prompt_length={len(prompt)}, chat_history_length={len(st.session_state.chat_history)}")
-            st.session_state.processing_request = False
+    user_question = st.chat_input("請輸入您想查詢的 LIHKG 話題（例如：有哪些搞笑話題？）")
     
-    if user_input and not preview_button and not st.session_state.processing_request:
-        logger.info(f"Processing user input: question={user_input}, platform={platform}, category={selected_cat}")
-        
-        submit_key = f"{user_input}:{platform}:{selected_cat}"
-        current_time = time.time()
-        if (st.session_state.last_submit_key == submit_key and 
-            current_time - st.session_state.last_submit_time < 5):
-            logger.warning("Skipping duplicate chat submission")
-            st.warning("請勿重複提交相同請求，請稍後再試。")
-            return
-        
-        st.session_state.processing_request = True
-        st.session_state.last_submit_key = submit_key
-        st.session_state.last_submit_time = current_time
-
+    if user_question:
         with st.chat_message("user"):
-            st.markdown(f"**用戶**：{user_input}")
+            st.markdown(user_question)
         
-        with st.chat_message("assistant"):
-            placeholder = st.empty()
-            debug_info = []
-            
-            cache_key = f"{platform}_{selected_cat}_{user_input}"
-            use_cache = cache_key in st.session_state.thread_content_cache and \
-                        time.time() - st.session_state.thread_content_cache[cache_key]["timestamp"] < \
-                        (LIHKG_API["CACHE_DURATION"] if platform == "LIHKG" else HKGOLDEN_API["CACHE_DURATION"])
-            
-            if use_cache:
-                logger.info(f"Using cache: platform={platform}, category={selected_cat}, question={user_input}")
-                result = st.session_state.thread_content_cache[cache_key]["data"]
-            else:
-                try:
-                    logger.info(f"Calling process_user_question: question={user_input}, platform={platform}, category={selected_cat}")
-                    result = await process_user_question(
-                        user_input,
-                        platform=platform,
-                        cat_id_map=categories,
-                        selected_cat=selected_cat
-                    )
-                    st.session_state.thread_content_cache[cache_key] = {
-                        "data": result,
-                        "timestamp": time.time()
-                    }
-                except Exception as e:
-                    debug_info.append(f"#### 調試信息：\n- 處理錯誤: 原因={str(e)}\n- 堆棧跟踪: {traceback.format_exc()}")
-                    error_message = f"處理失敗，原因：{str(e)}。請檢查問題格式或稍後重試。"
-                    placeholder.markdown(error_message)
-                    st.session_state.chat_history.append({
-                        "question": user_input,
-                        "response": error_message,
-                        "debug_info": debug_info,
-                        "timestamp": current_time
-                    })
-                    logger.error(f"Processing failed: question={user_input}, platform={platform}, error={str(e)}, traceback={traceback.format_exc()}")
-                    st.session_state.processing_request = False
-                    return
-            
-            response = result.get("response")
-            response_text = ""
+        with st.spinner("正在處理您的問題..."):
             try:
-                if isinstance(response, str):
-                    # 處理字符串回應
-                    response = response.strip()
-                    response = re.sub(r'\{\{ output \}\}|\{ output \}', '', response).strip()
-                    
-                    share_text = "無分享文字"
-                    reason = "無選擇理由"
-                    
-                    share_match = re.search(r'分享文字：\s*(.*?)(?=\n*選擇理由：|\Z)', response, re.DOTALL)
-                    reason_match = re.search(r'選擇理由：\s*(.*)', response, re.DOTALL)
-                    
-                    if share_match:
-                        share_text = share_match.group(1).strip()
-                    if reason_match:
-                        reason = reason_match.group(1).strip()
-                    
-                    response_text = f"**分享文字**：{share_text}\n\n**選擇理由**：{reason}"
-                    placeholder.markdown(response_text)
-                else:
-                    # 使用 st.write_stream 處理異步生成器
-                    full_response = []
-                    chunk_count = 0
-                    try:
-                        # 定義同步生成器，迭代異步生成器
-                        def sync_generator():
-                            nonlocal chunk_count
-                            loop = asyncio.get_running_loop()
-                            iterator = response.__aiter__()
-                            while True:
-                                try:
-                                    chunk = loop.run_until_complete(iterator.__anext__())
-                                    chunk_count += 1
-                                    logger.debug(f"Stream chunk {chunk_count}: content={chunk}")
-                                    if isinstance(chunk, str):
-                                        yield chunk
-                                    else:
-                                        logger.warning(f"Non-string chunk received: {chunk}")
-                                        yield str(chunk)
-                                except StopAsyncIteration:
-                                    logger.debug(f"Stream completed: total_chunks={chunk_count}")
-                                    break
-                                except Exception as e:
-                                    error_msg = f"無法生成回應，API 連接失敗：{str(e)}。請稍後重試。\n"
-                                    logger.error(
-                                        f"Stream error in sync_generator: error={str(e)}, "
-                                        f"chunk_count={chunk_count}, request_id={result.get('request_id', 'unknown')}, "
-                                        f"traceback={traceback.format_exc()}"
-                                    )
-                                    yield error_msg
-                                    break
-                        
-                        # 使用 st.write_stream 迭代並收集結果
-                        response_text = st.write_stream(sync_generator())
-                        if isinstance(response_text, str):
-                            full_response.append(response_text)
-                        elif isinstance(response_text, list):
-                            full_response.extend(response_text)
-                        elif response_text is None:
-                            logger.warning("st.write_stream returned None")
-                            full_response.append("無回應內容，請稍後重試。")
-                        
-                        # 確保非空回應
-                        response_text = "".join(str(item) for item in full_response) if full_response else "無回應內容，請稍後重試。"
-                        logger.info(
-                            f"Stream processing completed: question={user_input}, platform={platform}, "
-                            f"total_chunks={chunk_count}, response_length={len(response_text)}"
-                        )
-                        placeholder.markdown(response_text)
-                    except Exception as e:
-                        debug_info.append(
-                            f"#### 調試信息：\n- 流式處理錯誤: 原因={str(e)}\n"
-                            f"- 塊計數: {chunk_count}\n- 堆棧跟踪: {traceback.format_exc()}"
-                        )
-                        error_message = f"無法生成回應，API 連接失敗：{str(e)}。請稍後重試。"
-                        full_response.append(error_message)
-                        response_text = error_message
-                        placeholder.markdown(response_text)
-                        logger.error(
-                            f"Stream processing error: error={str(e)}, chunk_count={chunk_count}, "
-                            f"request_id={result.get('request_id', 'unknown')}, traceback={traceback.format_exc()}"
-                        )
-            except Exception as e:
-                debug_info.append(
-                    f"#### 調試信息：\n- 處理錯誤: 原因={str(e)}\n- 堆棧跟踪: {traceback.format_exc()}"
+                if time.time() < st.session_state.rate_limit_until:
+                    error_message = (
+                        f"API 速率限制中，請在 "
+                        f"{datetime.fromtimestamp(st.session_state.rate_limit_until, tz=HONG_KONG_TZ).strftime('%Y-%m-%d %H:%M:%S')} 後重試。"
+                    )
+                    with st.chat_message("assistant"):
+                        st.markdown(error_message)
+                    st.session_state.chat_history.append({
+                        "question": user_question,
+                        "answer": error_message
+                    })
+                    logger.warning(f"速率限制阻止請求: 問題={user_question}, 限制至={st.session_state.rate_limit_until}")
+                    return
+                
+                st.session_state.last_user_query = user_question
+                
+                logger.info(f"開始處理問題: 問題={user_question}, 分類={selected_cat}")
+                
+                cat_id = cat_id_map[selected_cat]
+                for cat_name, cat_id_val in cat_id_map.items():
+                    if cat_name in user_question:
+                        selected_cat = cat_name
+                        cat_id = cat_id_val
+                        break
+                
+                cache_key = str(cat_id)
+                cache_duration = 300
+                use_cache = False
+                if cache_key in st.session_state.topic_list_cache:
+                    cache_data = st.session_state.topic_list_cache[cache_key]
+                    if time.time() - cache_data["timestamp"] < cache_duration:
+                        result = {
+                            "items": cache_data["items"],
+                            "rate_limit_info": [],
+                            "request_counter": st.session_state.request_counter,
+                            "last_reset": st.session_state.last_reset,
+                            "rate_limit_until": st.session_state.rate_limit_until
+                        }
+                        use_cache = True
+                        logger.info(f"使用緩存: cat_id={cat_id}, 帖子數={len(result['items'])}")
+                
+                if not use_cache:
+                    result = await process_user_question(
+                        user_question,
+                        cat_id_map=cat_id_map,
+                        selected_cat=selected_cat,
+                        request_counter=st.session_state.request_counter,
+                        last_reset=st.session_state.last_reset,
+                        rate_limit_until=st.session_state.rate_limit_until
+                    )
+                    st.session_state.topic_list_cache[cache_key] = {
+                        "items": result.get("items", []),
+                        "timestamp": time.time()
+                    }
+                    logger.info(f"更新緩存: cat_id={cat_id}, 帖子數={len(result['items'])}")
+                
+                st.session_state.request_counter = result.get("request_counter", st.session_state.request_counter)
+                st.session_state.last_reset = result.get("last_reset", st.session_state.last_reset)
+                st.session_state.rate_limit_until = result.get("rate_limit_until", st.session_state.rate_limit_until)
+                
+                thread_data = result.get("thread_data", [])
+                rate_limit_info = result.get("rate_limit_info", [])
+                question_cat = result.get("selected_cat", selected_cat)
+                
+                logger.info(
+                    f"抓取完成: 問題={user_question}, 分類={question_cat}, "
+                    f"帖子數={len(thread_data)}, 速率限制信息={rate_limit_info if rate_limit_info else '無'}, "
+                    f"使用緩存={use_cache}"
                 )
-                error_message = f"無法生成回應，處理失敗：{str(e)}。請檢查問題格式或稍後重試。"
-                response_text = error_message
-                placeholder.markdown(error_message)
+                
+                if not thread_data:
+                    answer = f"在 {question_cat} 中未找到回覆數 ≥ 125 的帖子。"
+                    debug_info = []
+                    if rate_limit_info:
+                        debug_info.append("#### 調試信息：")
+                        debug_info.extend(f"- {info}" for info in rate_limit_info)
+                    answer += "\n".join(debug_info)
+                    with st.chat_message("assistant"):
+                        st.markdown(answer)
+                    st.session_state.chat_history.append({
+                        "question": user_question,
+                        "answer": answer
+                    })
+                    logger.warning(f"無有效帖子數據: 問題={user_question}, 分類={question_cat}, 錯誤={rate_limit_info}")
+                    return
+                
+                answer = f"### 來自 {question_cat} 的話題（回覆數 ≥ 125）：\n"
+                debug_info = ["#### 調試信息："]
+                failed_threads = []
+                successful_threads = []
+                
+                for item in thread_data:
+                    thread_id = item["thread_id"]
+                    if not item["replies"] and item["no_of_reply"] >= 125:
+                        failed_threads.append(thread_id)
+                        debug_info.append(f"- 帖子 ID {thread_id} 抓取失敗，可能無效或無權訪問（錯誤 998）。")
+                    else:
+                        successful_threads.append(thread_id)
+                    answer += (
+                        f"- 帖子 ID: {item['thread_id']}，標題: {item['title']}，"
+                        f"回覆數: {item['no_of_reply']}，"
+                        f"最後回覆時間: {datetime.fromtimestamp(int(item['last_reply_time']), tz=HONG_KONG_TZ).strftime('%Y-%m-%d %H:%M:%S') if item['last_reply_time'] else '未知'}，"
+                        f"正評: {item['like_count']}，負評: {item['dislike_count']}\n"
+                    )
+                    if item["replies"]:
+                        answer += "  回覆:\n"
+                        for idx, reply in enumerate(item["replies"], 1):
+                            answer += (
+                                f"    - 回覆 {idx}: {reply['msg'][:100]}"
+                                f"{'...' if len(reply['msg']) > 100 else ''} "
+                                f"(正評: {reply['like_count']}, 負評: {reply['dislike_count']})\n"
+                            )
+                
+                answer += f"\n共找到 {len(thread_data)} 篇符合條件的帖子。"
+                debug_info.append(f"- 成功抓取帖子數: {len(successful_threads)}，ID: {successful_threads}")
+                if failed_threads:
+                    debug_info.append(f"- 失敗帖子數: {len(failed_threads)}，ID: {failed_threads}")
+                    answer += f"\n警告：以下帖子無法獲取回覆（可能因錯誤 998）：{', '.join(map(str, failed_threads))}。"
+                
+                if rate_limit_info:
+                    debug_info.append("- 速率限制或錯誤記錄：")
+                    debug_info.extend(f"  - {info}" for info in rate_limit_info)
+                
+                debug_info.append(f"- 使用緩存: {use_cache}")
+                logger.info("\n".join(debug_info))
+                
+                try:
+                    grok_context = f"問題: {user_question}\n帖子數據:\n{answer}"
+                    if len(grok_context) > 7000:
+                        logger.warning(f"上下文接近限制: 字元數={len(grok_context)}，縮減回覆數據")
+                        for item in thread_data:
+                            item["replies"] = item["replies"][:1]
+                        answer = f"### 來自 {question_cat} 的話題（回覆數 ≥ 125）：\n"
+                        for item in thread_data:
+                            answer += (
+                                f"- 帖子 ID: {item['thread_id']}，標題: {item['title']}，"
+                                f"回覆數: {item['no_of_reply']}，"
+                                f"最後回覆時間: {datetime.fromtimestamp(int(item['last_reply_time']), tz=HONG_KONG_TZ).strftime('%Y-%m-%d %H:%M:%S') if item['last_reply_time'] else '未知'}，"
+                                f"正評: {item['like_count']}，負評: {item['dislike_count']}\n"
+                            )
+                            if item["replies"]:
+                                answer += "  回覆:\n"
+                                for idx, reply in enumerate(item["replies"], 1):
+                                    answer += (
+                                        f"    - 回覆 {idx}: {reply['msg'][:100]}"
+                                        f"{'...' if len(reply['msg']) > 100 else ''} "
+                                        f"(正評: {reply['like_count']}, 負評: {reply['dislike_count']})\n"
+                                    )
+                        answer += f"\n共找到 {len(thread_data)} 篇符合條件的帖子。"
+                        if failed_threads:
+                            answer += f"\n警告：以下帖子無法獲取回覆（可能因錯誤 998）：{', '.join(map(str, failed_threads))}。"
+                        grok_context = f"問題: {user_question}\n帖子數據:\n{answer}"
+                        debug_info.append(f"- 縮減後上下文: 字元數={len(grok_context)}")
+                        logger.info(f"縮減後上下文: 字元數={len(grok_context)}")
+                    
+                    grok_response = ""
+                    chunk_count = 0
+                    with st.chat_message("assistant"):
+                        grok_container = st.empty()
+                        try:
+                            async for chunk in stream_grok3_response(grok_context):
+                                chunk_count += 1
+                                logger.debug(f"Stream chunk {chunk_count}: content={chunk}")
+                                grok_response += chunk
+                                grok_container.markdown(grok_response + "\n\n" + "\n".join(debug_info))
+                            logger.info(f"Stream completed: total_chunks={chunk_count}, response_length={len(grok_response)}")
+                        except Exception as e:
+                            error_message = f"無法生成回應，API 連接失敗：{str(e)}\n\n{traceback.format_exc()}"
+                            logger.error(
+                                f"Stream error: question={user_question}, chunk_count={chunk_count}, "
+                                f"error={str(e)}, traceback={traceback.format_exc()}"
+                            )
+                            debug_info.append(f"- 流式錯誤: 原因={str(e)}, 塊計數={chunk_count}, 堆棧跟踪={traceback.format_exc()}")
+                            grok_response = error_message
+                            grok_container.markdown(grok_response + "\n\n" + "\n".join(debug_info))
+                    
+                    if grok_response and not grok_response.startswith("錯誤:"):
+                        final_answer = grok_response + "\n\n" + "\n".join(debug_info)
+                    else:
+                        final_answer = (grok_response or "無法獲取 Grok 3 建議。") + "\n\n" + "\n".join(debug_info)
+                
+                except Exception as e:
+                    logger.error(
+                        f"Grok 3 增強失敗: question={user_question}, error={str(e)}, "
+                        f"traceback={traceback.format_exc()}"
+                    )
+                    debug_info.append(f"- 處理錯誤: 原因={str(e)}, 堆棧跟踪={traceback.format_exc()}")
+                    final_answer = f"錯誤：無法獲取 Grok 3 建議，原因：{str(e)}\n\n" + "\n".join(debug_info)
+                    if failed_threads:
+                        final_answer += f"\n警告：以下帖子無法獲取回覆（可能因錯誤 998）：{', '.join(map(str, failed_threads))}。"
+                
+                with st.chat_message("assistant"):
+                    st.markdown(final_answer)
+                st.session_state.chat_history.append({
+                    "question": user_question,
+                    "answer": final_answer
+                })
+                
+            except Exception as e:
+                debug_info = [f"#### 調試信息：\n- 處理錯誤: 原因={str(e)}\n- 堆棧跟踪: {traceback.format_exc()}"]
+                if result.get("rate_limit_info"):
+                    debug_info.append("- 速率限制或錯誤記錄：")
+                    debug_info.extend(f"  - {info}" for info in result["rate_limit_info"])
+                error_message = f"處理失敗，原因：{str(e)}\n\n" + "\n".join(debug_info)
+                with st.chat_message("assistant"):
+                    st.markdown(error_message)
                 logger.error(
-                    f"General processing error: error={str(e)}, request_id={result.get('request_id', 'unknown')}, "
+                    f"處理錯誤: question={user_question}, error={str(e)}, "
                     f"traceback={traceback.format_exc()}"
                 )
-            
-            if result.get("rate_limit_info"):
-                debug_info.append("#### 調試信息：")
-                debug_info.append("- 速率限制或錯誤記錄：")
-                debug_info.extend(f"  - {info}" for info in result["rate_limit_info"])
-            
-            if not any(
-                chat["question"] == user_input and 
-                chat["response"] == response_text and 
-                not chat.get("is_preview") and 
-                abs(chat["timestamp"] - current_time) < 1
-                for chat in st.session_state.chat_history
-            ):
                 st.session_state.chat_history.append({
-                    "question": user_input,
-                    "response": response_text,
-                    "debug_info": debug_info if debug_info else None,
-                    "analysis": result.get("analysis"),
-                    "timestamp": current_time
+                    "question": user_question,
+                    "answer": error_message
                 })
-            
-            logger.info(f"Completed processing: question={user_input}, platform={platform}, chat_history_length={len(st.session_state.chat_history)}")
-            st.session_state.processing_request = False

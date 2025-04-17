@@ -231,36 +231,40 @@ async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, req
                         # 篩選帖子
                         filtered_items = filter_items(standardized_items, current_time_ms)
                         
-                        # 並行獲取回覆
-                        thread_tasks = [
-                            get_hkgolden_thread_content(
-                                thread_id=item["id"],
-                                cat_id=cat_id,
-                                request_counter=request_counter,
-                                last_reset=last_reset,
-                                rate_limit_until=rate_limit_until,
-                                fetch_all_pages=False  # 僅抓第一頁獲取 tr
-                            ) for item in filtered_items
-                        ]
-                        thread_results = await asyncio.gather(*thread_tasks, return_exceptions=True)
+                        # 並行獲取回覆（最多 5 個並發）
+                        max_concurrent = 5
+                        for i in range(0, len(filtered_items), max_concurrent):
+                            batch = filtered_items[i:i + max_concurrent]
+                            thread_tasks = [
+                                get_hkgolden_thread_content(
+                                    thread_id=item["id"],
+                                    cat_id=cat_id,
+                                    request_counter=request_counter,
+                                    last_reset=last_reset,
+                                    rate_limit_until=rate_limit_until,
+                                    max_replies=50  # 限制最多 50 條回覆
+                                ) for item in batch
+                            ]
+                            thread_results = await asyncio.gather(*thread_tasks, return_exceptions=True)
+                            
+                            for item, thread_data in zip(batch, thread_results):
+                                if isinstance(thread_data, Exception):
+                                    logger.error(f"Thread fetch error: thread_id={item['id']}, error={str(thread_data)}")
+                                    continue
+                                no_of_reply = thread_data.get("tr", item["nor"])
+                                if no_of_reply is None:
+                                    logger.warning(f"Invalid no_of_reply for thread_id={item['id']}, using nor={item['nor']}")
+                                    no_of_reply = item["nor"]
+                                item["no_of_reply"] = no_of_reply
+                                item["replies"] = thread_data.get("replies", [])[:50]  # 限制回覆數
+                                request_counter = thread_data.get("request_counter", request_counter)
+                                total_requests += thread_data.get("request_counter_increment", 0)
+                                last_reset = thread_data.get("last_reset", last_reset)
+                                rate_limit_until = thread_data.get("rate_limit_until", rate_limit_until)
+                                rate_limit_info.extend(thread_data.get("rate_limit_info", []))
                         
-                        for item, thread_data in zip(filtered_items, thread_results):
-                            if isinstance(thread_data, Exception):
-                                logger.error(f"Thread fetch error: thread_id={item['id']}, error={str(thread_data)}")
-                                continue
-                            tr = thread_data.get("tr", item["nor"])
-                            if tr is None:
-                                logger.warning(f"Invalid tr for thread_id={item['id']}, using nor={item['nor']}")
-                                tr = item["nor"]
-                            item["tr"] = tr
-                            request_counter = thread_data.get("request_counter", request_counter)
-                            last_reset = thread_data.get("last_reset", last_reset)
-                            rate_limit_until = thread_data.get("rate_limit_until", rate_limit_until)
-                            rate_limit_info.extend(thread_data.get("rate_limit_info", []))
-                            logger.info(f"Fetched thread_id={item['id']}, tr={tr}")
-                        
-                        # 過濾無效 tr 的帖子
-                        valid_items = [item for item in filtered_items if item["tr"] is not None]
+                        # 過濾無效 no_of_reply 的帖子
+                        valid_items = [item for item in filtered_items if item["no_of_reply"] is not None]
                         items.extend(valid_items)
                         break
                     
@@ -274,7 +278,7 @@ async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, req
                     await asyncio.sleep(1)
                     break
             
-            # 動態延遲：請求越多，延遲越長
+            # 動態延遲
             delay = HKGOLDEN_API["REQUEST_DELAY"] * (1 + total_requests / 20)
             await asyncio.sleep(delay)
     
@@ -291,7 +295,7 @@ async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, req
         "rate_limit_until": rate_limit_until
     }
 
-async def get_hkgolden_thread_content(thread_id, cat_id=None, request_counter=0, last_reset=0, rate_limit_until=0, fetch_all_pages=True):
+async def get_hkgolden_thread_content(thread_id, cat_id=None, request_counter=0, last_reset=0, rate_limit_until=0, max_replies=50):
     cache_key = f"hkgolden_thread_{thread_id}"
     if cache_key in st.session_state.thread_content_cache:
         cache_data = st.session_state.thread_content_cache[cache_key]
@@ -316,7 +320,8 @@ async def get_hkgolden_thread_content(thread_id, cat_id=None, request_counter=0,
     total_replies = None
     rate_limit_info = []
     max_retries = 3
-    total_requests = 0
+    request_counter_increment = 0
+    pages_fetched = []
     start_time = time.time()
     
     current_time = time.time()
@@ -331,14 +336,14 @@ async def get_hkgolden_thread_content(thread_id, cat_id=None, request_counter=0,
             "tr": total_replies,
             "rate_limit_info": rate_limit_info,
             "request_counter": request_counter,
+            "request_counter_increment": request_counter_increment,
             "last_reset": last_reset,
             "rate_limit_until": rate_limit_until
         }
     
     async with aiohttp.ClientSession() as session:
-        max_pages = float('inf') if fetch_all_pages else 1
-        pages_fetched = []
-        while page <= max_pages:
+        logger.info(f"Fetching thread_id={thread_id}, pages=1-all")
+        while True:
             if current_time - last_reset >= 60:
                 request_counter = 0
                 last_reset = current_time
@@ -361,14 +366,11 @@ async def get_hkgolden_thread_content(thread_id, cat_id=None, request_counter=0,
                 "request_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
             }
             
-            if page == 1:
-                logger.info(f"Fetching thread_id={thread_id}, pages=1-{'all' if fetch_all_pages else '1'}")
-            
             for attempt in range(max_retries):
                 try:
                     await rate_limiter.acquire(context=fetch_conditions)
                     request_counter += 1
-                    total_requests += 1
+                    request_counter_increment += 1
                     async with session.get(url, headers=headers, params=params, timeout=10) as response:
                         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
                         if response.status == 429:
@@ -428,6 +430,10 @@ async def get_hkgolden_thread_content(thread_id, cat_id=None, request_counter=0,
                         replies.extend(standardized_replies)
                         pages_fetched.append(page)
                         page += 1
+                        
+                        # 檢查是否達到最大回覆數
+                        if len(replies) >= max_replies:
+                            break
                         break
                     
                 except Exception as e:
@@ -441,11 +447,13 @@ async def get_hkgolden_thread_content(thread_id, cat_id=None, request_counter=0,
                     break
             
             # 動態延遲
-            delay = HKGOLDEN_API["REQUEST_DELAY"] * (1 + total_requests / 20)
+            delay = HKGOLDEN_API["REQUEST_DELAY"] * (1 + request_counter_increment / 20)
             await asyncio.sleep(delay)
             current_time = time.time()
             
             if total_replies and len(replies) >= total_replies:
+                break
+            if len(replies) >= max_replies:
                 break
         
         # 確保 tr 有效
@@ -460,11 +468,12 @@ async def get_hkgolden_thread_content(thread_id, cat_id=None, request_counter=0,
         )
     
     result = {
-        "replies": replies,
+        "replies": replies[:max_replies],
         "title": thread_title,
         "tr": total_replies,
         "rate_limit_info": rate_limit_info,
         "request_counter": request_counter,
+        "request_counter_increment": request_counter_increment,
         "last_reset": last_reset,
         "rate_limit_until": rate_limit_until
     }

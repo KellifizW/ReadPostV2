@@ -3,7 +3,6 @@ import asyncio
 from datetime import datetime
 import pytz
 from data_processor import process_user_question
-from grok3_client import call_grok3_api
 import time
 from config import LIHKG_API, HKGOLDEN_API, GENERAL
 import streamlit.logger
@@ -29,8 +28,8 @@ async def chat_page():
         st.session_state.last_submit_key = None
     if "last_submit_time" not in st.session_state:
         st.session_state.last_submit_time = 0
-    if "input_processed" not in st.session_state:
-        st.session_state.input_processed = False
+    if "processing_request" not in st.session_state:
+        st.session_state.processing_request = False
 
     # 檢查速率限制
     if time.time() < st.session_state.rate_limit_until:
@@ -71,15 +70,17 @@ async def chat_page():
                         for info in chat["debug_info"]:
                             st.markdown(info)
     
-    # 用戶輸入與預覽按鈕
-    col1, col2 = st.columns([4, 1])
-    with col1:
-        user_input = st.chat_input("輸入你的問題或要求（例如：分享任何帖文）", key="chat_page_chat_input")
-    with col2:
-        preview_button = st.button("預覽", key="preview_button")
+    # 用戶輸入與按鈕
+    user_input = st.chat_input("輸入你的問題或要求（例如：分享任何帖文）", key="chat_page_chat_input")
+    preview_button = st.button("預覽", key="preview_button")
+
+    # 防止並發處理
+    if st.session_state.processing_request:
+        st.warning("正在處理請求，請稍候。")
+        return
 
     # 處理預覽按鈕
-    if preview_button and user_input and not st.session_state.input_processed:
+    if preview_button and user_input:
         logger.info(f"Generating prompt preview: question={user_input}, platform={platform}, category={selected_cat}")
         
         # 檢查重複提交
@@ -91,8 +92,7 @@ async def chat_page():
             st.warning("請勿重複提交相同預覽請求，請稍後再試。")
             return
         
-        # 標記輸入已處理
-        st.session_state.input_processed = True
+        st.session_state.processing_request = True
         st.session_state.last_submit_key = submit_key
         st.session_state.last_submit_time = current_time
 
@@ -139,10 +139,11 @@ async def chat_page():
                         "question": user_input,
                         "response": error_message,
                         "debug_info": debug_info,
-                        "is_preview": True
+                        "is_preview": True,
+                        "timestamp": current_time
                     })
                     logger.error(f"Preview failed: question={user_input}, platform={platform}, error={str(e)}")
-                    st.session_state.input_processed = False
+                    st.session_state.processing_request = False
                     return
             
             prompt = result.get("response", "無提示內容")
@@ -155,20 +156,27 @@ async def chat_page():
                 debug_info.extend(f"  - {info}" for info in result["rate_limit_info"])
             
             # 避免重複追加聊天記錄
-            if not any(chat["question"] == user_input and chat["response"] == prompt and chat.get("is_preview") for chat in st.session_state.chat_history):
+            if not any(
+                chat["question"] == user_input and 
+                chat["response"] == prompt and 
+                chat.get("is_preview") and 
+                abs(chat["timestamp"] - current_time) < 1
+                for chat in st.session_state.chat_history
+            ):
                 st.session_state.chat_history.append({
                     "question": user_input,
                     "response": prompt,
                     "debug_info": debug_info if debug_info else None,
                     "analysis": result.get("analysis"),
-                    "is_preview": True
+                    "is_preview": True,
+                    "timestamp": current_time
                 })
             
             logger.info(f"Completed preview: question={user_input}, platform={platform}, prompt_length={len(prompt)}, chat_history_length={len(st.session_state.chat_history)}")
-            st.session_state.input_processed = False
+            st.session_state.processing_request = False
     
     # 處理正常提交
-    if user_input and not preview_button and not st.session_state.input_processed:
+    if user_input and not preview_button and not st.session_state.processing_request:
         logger.info(f"Processing user input: question={user_input}, platform={platform}, category={selected_cat}")
         
         # 檢查重複提交
@@ -180,8 +188,7 @@ async def chat_page():
             st.warning("請勿重複提交相同請求，請稍後再試。")
             return
         
-        # 標記輸入已處理
-        st.session_state.input_processed = True
+        st.session_state.processing_request = True
         st.session_state.last_submit_key = submit_key
         st.session_state.last_submit_time = current_time
 
@@ -226,10 +233,11 @@ async def chat_page():
                     st.session_state.chat_history.append({
                         "question": user_input,
                         "response": error_message,
-                        "debug_info": debug_info
+                        "debug_info": debug_info,
+                        "timestamp": current_time
                     })
                     logger.error(f"Processing failed: question={user_input}, platform={platform}, error={str(e)}")
-                    st.session_state.input_processed = False
+                    st.session_state.processing_request = False
                     return
             
             response = result.get("response", "無回應內容")
@@ -241,17 +249,20 @@ async def chat_page():
                 debug_info.extend(f"  - {info}" for info in result["rate_limit_info"])
             
             # 避免重複追加聊天記錄
-            if not any(chat["question"] == user_input and chat["response"] == response and not chat.get("is_preview") for chat in st.session_state.chat_history):
+            if not any(
+                chat["question"] == user_input and 
+                chat["response"] == response and 
+                not chat.get("is_preview") and 
+                abs(chat["timestamp"] - current_time) < 1
+                for chat in st.session_state.chat_history
+            ):
                 st.session_state.chat_history.append({
                     "question": user_input,
                     "response": response,
                     "debug_info": debug_info if debug_info else None,
-                    "analysis": result.get("analysis")
+                    "analysis": result.get("analysis"),
+                    "timestamp": current_time
                 })
             
             logger.info(f"Completed processing: question={user_input}, platform={platform}, response_length={len(response)}, chat_history_length={len(st.session_state.chat_history)}")
-            st.session_state.input_processed = False
-    
-    # 重置輸入狀態（在每次渲染結束後）
-    if not user_input:
-        st.session_state.input_processed = False
+            st.session_state.processing_request = False

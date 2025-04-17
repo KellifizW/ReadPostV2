@@ -142,7 +142,18 @@ async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, req
                             await asyncio.sleep(1)
                             break
                         
-                        data = await response.json()
+                        try:
+                            data = await response.json()
+                        except aiohttp.ContentTypeError:
+                            rate_limit_info.append(
+                                f"{current_time} - Invalid JSON response: cat_id={cat_id}, page={page}, content_type={response.content_type}"
+                            )
+                            logger.error(
+                                f"Invalid JSON response: cat_id={cat_id}, page={page}, content_type={response.content_type}, conditions={fetch_conditions}"
+                            )
+                            break
+                        
+                        logger.info(f"Raw response for cat_id={cat_id}, page={page}: {data}")  # 記錄原始響應
                         if not data.get("result", True):
                             error_message = data.get("error_message", "Unknown error")
                             rate_limit_info.append(
@@ -154,25 +165,70 @@ async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, req
                             await asyncio.sleep(1)
                             break
                         
-                        new_items = data.get("data", [])
-                        if not new_items:
+                        # 提取帖子列表
+                        data_content = data.get("data", {})
+                        logger.info(f"Data content for cat_id={cat_id}, page={page}: {data_content}")  # 記錄 data 內容
+                        new_items = data_content.get("list", [])  # 優先使用 data["data"]["list"]
+                        
+                        # 兼容其他可能的結構
+                        if not new_items and isinstance(data_content, dict):
+                            new_items = (
+                                data_content.get("items", []) or
+                                data_content.get("threads", []) or
+                                data_content.get("topics", []) or
+                                []
+                            )
+                        elif isinstance(data.get("data"), list):
+                            new_items = data.get("data", [])  # 兼容舊結構
+                        elif isinstance(data.get("data"), str):
+                            rate_limit_info.append(
+                                f"{current_time} - Data is a string, cannot parse: cat_id={cat_id}, page={page}, data={data['data']}"
+                            )
+                            logger.error(
+                                f"Data is a string: cat_id={cat_id}, page={page}, data={data['data']}, conditions={fetch_conditions}"
+                            )
+                            break
+                        else:
+                            rate_limit_info.append(
+                                f"{current_time} - Invalid data structure: cat_id={cat_id}, page={page}, data={data}"
+                            )
+                            logger.error(
+                                f"Invalid data structure: cat_id={cat_id}, page={page}, data={data}, conditions={fetch_conditions}"
+                            )
                             break
                         
-                        standardized_items = [
-                            {
-                                "thread_id": item["id"],
-                                "title": item.get("title", "Unknown title"),
-                                "no_of_reply": item.get("totalReplies", 0),
-                                "last_reply_time": item.get("lastReplyDate", 0) / 1000,
-                                "like_count": item.get("marksGood", 0),
-                                "dislike_count": item.get("marksBad", 0)
-                            }
-                            for item in new_items
-                        ]
+                        logger.info(f"Extracted items for cat_id={cat_id}, page={page}: {len(new_items)} items")  # 記錄提取的項目數
+                        standardized_items = []
+                        for item in new_items:
+                            if not isinstance(item, dict):
+                                rate_limit_info.append(
+                                    f"{current_time} - Invalid item type: cat_id={cat_id}, page={page}, item={item}, type={type(item)}"
+                                )
+                                logger.error(
+                                    f"Invalid item type: cat_id={cat_id}, page={page}, item={item}, type={type(item)}, conditions={fetch_conditions}"
+                                )
+                                continue
+                            try:
+                                standardized_items.append({
+                                    "thread_id": item["id"],
+                                    "title": item.get("title", "Unknown title"),
+                                    "no_of_reply": item.get("totalReplies", 0),
+                                    "last_reply_time": item.get("lastReplyDate", 0) / 1000,  # 毫秒轉秒
+                                    "like_count": item.get("marksGood", 0),
+                                    "dislike_count": item.get("marksBad", 0)
+                                })
+                            except (TypeError, KeyError) as e:
+                                rate_limit_info.append(
+                                    f"{current_time} - Item parsing error: cat_id={cat_id}, page={page}, item={item}, error={str(e)}"
+                                )
+                                logger.error(
+                                    f"Item parsing error: cat_id={cat_id}, page={page}, item={item}, error={str(e)}, conditions={fetch_conditions}"
+                                )
+                                continue
                         
                         logger.info(
                             f"Fetch successful: cat_id={cat_id}, page={page}, items={len(new_items)}, "
-                            f"conditions={fetch_conditions}"
+                            f"standardized_items={len(standardized_items)}, conditions={fetch_conditions}"
                         )
                         
                         items.extend(standardized_items)

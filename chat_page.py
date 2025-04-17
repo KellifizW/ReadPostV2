@@ -2,6 +2,7 @@ import streamlit as st
 import asyncio
 from datetime import datetime
 import pytz
+import re  # 添加 re 導入
 from data_processor import process_user_question
 import time
 from config import LIHKG_API, HKGOLDEN_API, GENERAL
@@ -267,7 +268,7 @@ async def chat_page():
             if share_match:
                 share_text = share_match.group(1).strip()
             if reason_match:
-                reason = reason_match.group(1).strip()
+                reason = share_match.group(1).strip()
             
             placeholder.markdown(f"**分享文字**：{share_text}")
             placeholder.markdown(f"**選擇理由**：{reason}")

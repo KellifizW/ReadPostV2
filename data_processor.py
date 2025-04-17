@@ -62,75 +62,92 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, mi
     cat_id = cat_id_map[selected_cat]
     
     start_fetch_time = time.time()
-    if platform == "LIHKG":
-        result = await get_lihkg_topic_list(
-            cat_id=cat_id,
-            sub_cat_id=0,
-            start_page=1,
-            max_pages=LIHKG_API["MAX_PAGES"],
-            request_counter=st.session_state.get("request_counter", 0),
-            last_reset=st.session_state.get("last_reset", time.time()),
-            rate_limit_until=st.session_state.get("rate_limit_until", 0)
-        )
-    else:
-        result = await get_hkgolden_topic_list(
-            cat_id=cat_id,
-            sub_cat_id=0,
-            start_page=1,
-            max_pages=HKGOLDEN_API["MAX_PAGES"],
-            request_counter=st.session_state.get("request_counter", 0),
-            last_reset=st.session_state.get("last_reset", time.time()),
-            rate_limit_until=st.session_state.get("rate_limit_until", 0)
-        )
+    all_items = []
+    rate_limit_info = []
+    
+    # 多頁抓取並合併
+    for page in range(1, HKGOLDEN_API["MAX_PAGES"] + 1):
+        logger.info(f"Fetching cat_id={cat_id}, page={page}")
+        if platform == "LIHKG":
+            result = await get_lihkg_topic_list(
+                cat_id=cat_id,
+                sub_cat_id=0,
+                start_page=page,
+                max_pages=1,
+                request_counter=st.session_state.get("request_counter", 0),
+                last_reset=st.session_state.get("last_reset", time.time()),
+                rate_limit_until=st.session_state.get("rate_limit_until", 0)
+            )
+        else:
+            result = await get_hkgolden_topic_list(
+                cat_id=cat_id,
+                sub_cat_id=0,
+                start_page=page,
+                max_pages=1,
+                request_counter=st.session_state.get("request_counter", 0),
+                last_reset=st.session_state.get("last_reset", time.time()),
+                rate_limit_until=st.session_state.get("rate_limit_until", 0)
+            )
+        
+        items = result["items"]
+        rate_limit_info.extend(result["rate_limit_info"])
+        st.session_state.request_counter = result["request_counter"]
+        st.session_state.last_reset = result["last_reset"]
+        st.session_state.rate_limit_until = result["rate_limit_until"]
+        
+        logger.info(f"Fetched {len(items)} items for cat_id={cat_id}, page={page}")
+        all_items.extend(items)
+        
+        # 記錄每個帖子的 no_of_reply
+        for item in items:
+            logger.debug(f"Item: id={item.get('id')}, no_of_reply={item.get('no_of_reply')}, replies_count={len(item.get('replies', []))}")
+    
     fetch_elapsed = time.time() - start_fetch_time
-    logger.info(f"Fetch completed: platform={platform}, category={selected_cat}, elapsed={fetch_elapsed:.2f}s")
+    logger.info(f"Fetch completed: platform={platform}, category={selected_cat}, total_items={len(all_items)}, elapsed={fetch_elapsed:.2f}s")
     
-    items = result["items"]
-    rate_limit_info = result["rate_limit_info"]
-    st.session_state.request_counter = result["request_counter"]
-    st.session_state.last_reset = result["last_reset"]
-    st.session_state.rate_limit_until = result["rate_limit_until"]
+    # 過濾滿足 min_replies 的帖子
+    filtered_items = [item for item in all_items if item.get("no_of_reply", 0) >= min_replies]
+    logger.info(f"Filtered items: total={len(all_items)}, filtered={len(filtered_items)} with no_of_reply >= {min_replies}")
     
-    # 記錄每個帖子的 no_of_reply
-    for item in items:
-        logger.debug(f"Item: id={item.get('id')}, no_of_reply={item.get('no_of_reply')}, replies_count={len(item.get('replies', []))}")
-    
-    filtered_items = [item for item in items if item["no_of_reply"] >= min_replies]
-    logger.info(f"Filtered items: total={len(items)}, filtered={len(filtered_items)} with no_of_reply >= {min_replies}")
+    # 記錄 filtered_items 的詳細信息
+    for item in filtered_items:
+        logger.debug(f"Filtered item: id={item.get('id')}, no_of_reply={item.get('no_of_reply')}, replies_count={len(item.get('replies', []))}")
     
     if not filtered_items:
         logger.warning(f"No posts found with no_of_reply >= {min_replies}")
         # 備用邏輯：選擇回覆數最多的帖子
-        if items:
-            filtered_items = [max(items, key=lambda x: x["no_of_reply"])]
+        if all_items:
+            filtered_items = [max(all_items, key=lambda x: x.get("no_of_reply", 0))]
             logger.info(f"Fallback: Selected post with {filtered_items[0]['no_of_reply']} replies (below min_replies={min_replies})")
         else:
+            logger.error("No items fetched from API")
             return {
                 "response": f"無符合條件的帖子（最少回覆數：{min_replies}）。請嘗試降低回覆數量要求或更改分類。",
                 "rate_limit_info": rate_limit_info,
                 "processed_data": []
             }
     
-    # 放寬回覆驗證條件，允許少於 3 條非空回覆
-    valid_items = filtered_items  # 直接使用 filtered_items，移除嚴格的回覆數檢查
-    for item in filtered_items:
+    # 使用 filtered_items 作為 valid_items，移除嚴格回覆檢查
+    valid_items = filtered_items
+    for item in valid_items:
         non_empty_replies = len([r for r in item.get("replies", []) if r["msg"].strip()])
-        logger.debug(f"Item: id={item.get('id')}, no_of_reply={item.get('no_of_reply')}, non_empty_replies={non_empty_replies}")
+        logger.debug(f"Valid item: id={item.get('id')}, no_of_reply={item.get('no_of_reply')}, non_empty_replies={non_empty_replies}")
     
     if not valid_items:
-        logger.warning("No valid posts after reply validation")
-        # 備用邏輯：使用 filtered_items 中回覆數最多的帖子
-        valid_items = filtered_items
-        logger.info("Fallback: Using posts without strict reply validation")
-        if not valid_items:
-            return {
-                "response": f"無帖子包含足夠的有效回覆（最少回覆數：{min_replies}）。請嘗試降低回覆數量要求或稍後重試。",
-                "rate_limit_info": rate_limit_info,
-                "processed_data": []
-            }
+        logger.warning("No valid posts after processing")
+        valid_items = filtered_items  # 再次使用 filtered_items 作為備用
+        logger.info("Fallback: Using filtered_items without further validation")
     
     current_time = time.time()
     scored_items = [(item, score_item(item, current_time)) for item in valid_items]
+    if not scored_items:
+        logger.error("No scored items available")
+        return {
+            "response": f"無法選擇帖子（最少回覆數：{min_replies}）。請嘗試降低回覆數量要求或更改分類。",
+            "rate_limit_info": rate_limit_info,
+            "processed_data": []
+        }
+    
     selected_item = max(scored_items, key=lambda x: x[1])[0]
     
     try:
@@ -161,7 +178,6 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, mi
     
     if not processed_data:
         logger.warning(f"No valid replies for thread_id={thread_id}")
-        # 備用邏輯：生成無回覆的回應
         response = f"""
 Hot thread on 高登討論區 with {selected_item["no_of_reply"]} replies! "{thread_title[:50]}" sparks debate. No valid replies found.
 

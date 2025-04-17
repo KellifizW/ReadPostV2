@@ -10,9 +10,6 @@ from config import LIHKG_API, HKGOLDEN_API
 
 logger = streamlit.logger.get_logger(__name__)
 
-# 確認 HKGOLDEN_API 是否正確加載
-logger.info(f"HKGOLDEN_API loaded: {HKGOLDEN_API}")
-
 def clean_expired_cache(platform):
     """清理過期緩存"""
     cache_duration = LIHKG_API["CACHE_DURATION"] if platform == "LIHKG" else HKGOLDEN_API["CACHE_DURATION"]
@@ -23,6 +20,8 @@ def clean_expired_cache(platform):
 
 async def process_user_question(question, platform, cat_id_map, selected_cat):
     """處理用戶問題並返回相關帖子數據"""
+    logger.info(f"Processing question: question={question}, platform={platform}, category={selected_cat}")
+    
     clean_expired_cache(platform)
     
     cat_id = cat_id_map[selected_cat]
@@ -58,6 +57,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat):
     filtered_items = [item for item in items if item["no_of_reply"] >= min_replies]
     
     if not filtered_items:
+        logger.warning(f"No posts found with no_of_reply >= {min_replies}")
         return {
             "response": "無符合條件的帖子，請嘗試其他分類或稍後重試。",
             "rate_limit_info": rate_limit_info,
@@ -65,24 +65,19 @@ async def process_user_question(question, platform, cat_id_map, selected_cat):
         }
     
     selected_item = random.choice(filtered_items)
-    thread_id = selected_item["thread_id"]
+    thread_id = selected_item["id"] if platform == "HKGOLDEN" else selected_item["thread_id"]
+    thread_title = selected_item["title"]
+    replies = selected_item.get("replies", [])
     
-    if platform == "LIHKG":
-        thread_result = await get_lihkg_thread_content(thread_id, cat_id)
-    else:
-        thread_result = await get_hkgolden_thread_content(thread_id, cat_id)
-    
-    thread_title = thread_result["title"]
-    replies = thread_result["replies"]
-    rate_limit_info.extend(thread_result["rate_limit_info"])
+    logger.info(f"Selected thread: thread_id={thread_id}, title={thread_title}, replies={len(replies)}")
     
     processed_data = [
         {
             "thread_id": thread_id,
             "title": thread_title,
             "content": clean_html(reply["msg"]),
-            "like_count": reply["like_count"],
-            "dislike_count": reply["dislike_count"]
+            "like_count": reply.get("like_count", 0),  # 高登無此字段，設為 0
+            "dislike_count": reply.get("dislike_count", 0)  # 高登無此字段，設為 0
         }
         for reply in replies
     ]

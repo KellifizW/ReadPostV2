@@ -9,12 +9,11 @@ from config import LIHKG_API, HKGOLDEN_API, GENERAL
 import streamlit.logger
 
 logger = streamlit.logger.get_logger(__name__)
-HONG_KONG_TZ = pytz.timezone(GENERAL["TIMEZONE"])
+HONG_KONG_TZ = pytz.timezone("Asia/Hong_Kong")
 
 async def chat_page():
     st.title("討論區聊天介面")
     
-    # 初始化 session_state
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
     if "rate_limit_until" not in st.session_state:
@@ -32,12 +31,10 @@ async def chat_page():
     if "processing_request" not in st.session_state:
         st.session_state.processing_request = False
 
-    # 檢查速率限制
     if time.time() < st.session_state.rate_limit_until:
         st.error(f"API 速率限制中，請在 {datetime.fromtimestamp(st.session_state.rate_limit_until, tz=HONG_KONG_TZ).strftime('%Y-%m-%d %H:%M:%S')} 後重試。")
         return
     
-    # 平台與分類選擇
     platform = st.selectbox("選擇討論區平台", ["LIHKG", "高登討論區"], index=0)
     if platform == "LIHKG":
         categories = LIHKG_API["CATEGORIES"]
@@ -46,7 +43,6 @@ async def chat_page():
     
     selected_cat = st.selectbox("選擇分類", options=list(categories.keys()), index=0)
     
-    # 顯示聊天記錄
     st.markdown("### 聊天記錄")
     for chat in st.session_state.chat_history:
         with st.chat_message("user"):
@@ -56,16 +52,13 @@ async def chat_page():
                 st.markdown("**提示預覽**：")
                 st.code(chat['response'], language="text")
             else:
-                # 改進回應解析邏輯
                 response = chat['response'].strip()
+                response = re.sub(r'\{\{ output \}\}', '', response).strip()
+                
                 share_text = "無分享文字"
                 reason = "無選擇理由"
                 
-                # 清理多餘的 { output } 標記
-                response = re.sub(r'\{\{ output \}\}', '', response).strip()
-                
-                # 使用正則表達式提取分享文字和選擇理由
-                share_match = re.search(r'分享文字：\s*(.*?)(?=\n選擇理由：|$)', response, re.DOTALL)
+                share_match = re.search(r'分享文字：\s*(.*?)(?=\n選擇理由：|\Z)', response, re.DOTALL)
                 reason_match = re.search(r'選擇理由：\s*(.*)', response, re.DOTALL)
                 
                 if share_match:
@@ -73,7 +66,6 @@ async def chat_page():
                 if reason_match:
                     reason = reason_match.group(1).strip()
                 
-                # 確保顯示分享文字和選擇理由
                 if share_text != "無分享文字":
                     st.markdown(f"**分享文字**：{share_text}")
                 if reason != "無選擇理由":
@@ -93,20 +85,16 @@ async def chat_page():
                         for info in chat["debug_info"]:
                             st.markdown(info)
     
-    # 用戶輸入與按鈕
     user_input = st.chat_input("輸入你的問題或要求（例如：分享任何帖文）", key="chat_page_chat_input")
     preview_button = st.button("預覽", key="preview_button")
 
-    # 防止並發處理
     if st.session_state.processing_request:
         st.warning("正在處理請求，請稍候。")
         return
 
-    # 處理預覽按鈕
     if preview_button and user_input:
         logger.info(f"Preview button clicked: question={user_input}, platform={platform}, category={selected_cat}")
         
-        # 檢查重複提交
         submit_key = f"preview:{user_input}:{platform}:{selected_cat}"
         current_time = time.time()
         if (st.session_state.last_submit_key == submit_key and 
@@ -119,11 +107,9 @@ async def chat_page():
         st.session_state.last_submit_key = submit_key
         st.session_state.last_submit_time = current_time
 
-        # 顯示用戶輸入
         with st.chat_message("user"):
             st.markdown(f"**用戶**：{user_input}")
         
-        # 生成提示
         with st.chat_message("assistant"):
             placeholder = st.empty()
             debug_info = []
@@ -178,7 +164,6 @@ async def chat_page():
                 debug_info.append("- 速率限制或錯誤記錄：")
                 debug_info.extend(f"  - {info}" for info in result["rate_limit_info"])
             
-            # 避免重複追加聊天記錄
             if not any(
                 chat["question"] == user_input and 
                 chat["response"] == prompt and 
@@ -198,11 +183,9 @@ async def chat_page():
             logger.info(f"Completed preview: question={user_input}, platform={platform}, prompt_length={len(prompt)}, chat_history_length={len(st.session_state.chat_history)}")
             st.session_state.processing_request = False
     
-    # 處理正常提交
     if user_input and not preview_button and not st.session_state.processing_request:
         logger.info(f"Processing user input: question={user_input}, platform={platform}, category={selected_cat}")
         
-        # 檢查重複提交
         submit_key = f"{user_input}:{platform}:{selected_cat}"
         current_time = time.time()
         if (st.session_state.last_submit_key == submit_key and 
@@ -215,11 +198,9 @@ async def chat_page():
         st.session_state.last_submit_key = submit_key
         st.session_state.last_submit_time = current_time
 
-        # 顯示用戶輸入
         with st.chat_message("user"):
             st.markdown(f"**用戶**：{user_input}")
         
-        # 處理請求
         with st.chat_message("assistant"):
             placeholder = st.empty()
             debug_info = []
@@ -264,14 +245,12 @@ async def chat_page():
                     return
             
             response = result.get("response", "無回應內容")
-            # 清理多餘的 { output } 標記
             response = re.sub(r'\{\{ output \}\}', '', response).strip()
             
-            # 使用正則表達式提取分享文字和選擇理由
             share_text = "無分享文字"
             reason = "無選擇理由"
             
-            share_match = re.search(r'分享文字：\s*(.*?)(?=\n選擇理由：|$)', response, re.DOTALL)
+            share_match = re.search(r'分享文字：\s*(.*?)(?=\n選擇理由：|\Z)', response, re.DOTALL)
             reason_match = re.search(r'選擇理由：\s*(.*)', response, re.DOTALL)
             
             if share_match:
@@ -279,7 +258,6 @@ async def chat_page():
             if reason_match:
                 reason = reason_match.group(1).strip()
             
-            # 確保顯示分享文字和選擇理由
             if share_text != "無分享文字":
                 placeholder.markdown(f"**分享文字**：{share_text}")
             if reason != "無選擇理由":
@@ -290,7 +268,6 @@ async def chat_page():
                 debug_info.append("- 速率限制或錯誤記錄：")
                 debug_info.extend(f"  - {info}" for info in result["rate_limit_info"])
             
-            # 避免重複追加聊天記錄
             if not any(
                 chat["question"] == user_input and 
                 chat["response"] == response and 

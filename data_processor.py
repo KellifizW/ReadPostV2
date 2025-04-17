@@ -1,4 +1,3 @@
-```python
 import asyncio
 from lihkg_api import get_lihkg_topic_list, get_lihkg_thread_content
 from hkgolden_api import get_hkgolden_topic_list, get_hkgolden_thread_content
@@ -26,7 +25,7 @@ def clean_expired_cache(platform):
 
 def clean_reply_text(text):
     """清理回覆中的 HTML 標籤，保留純文字"""
-    text = re.sub(r'<img[^>]+alt="\[([^\]]+)\]"[^>]*>', r'[\1]', text)
+    text = re.sub(r'<img[^>]+alt="$$ ([^ $$]+)\]"[^>]*>', r'[\1]', text)
     text = clean_html(text)
     text = ' '.join(text.split())
     return text
@@ -228,4 +227,3 @@ Details:
     logger.info(f"Processed question: question={question}, platform={platform}, response_length={len(response)}")
     
     return result
-```

@@ -6,6 +6,7 @@ import json
 from typing import AsyncGenerator
 from config import GROK3_API
 import time
+import aiohttp_retry
 
 logger = streamlit.logger.get_logger(__name__)
 
@@ -18,15 +19,13 @@ def log_prompt_to_file(prompt: str):
         logger.error(f"Failed to write prompt to file: {str(e)}")
 
 async def stream_grok3_response(prompt: str) -> AsyncGenerator[str, None]:
-    """Stream response from Grok 3 API"""
-    # 分段記錄長 prompt
+    """Stream response from Grok 3 API with retry"""
     logger.info(f"Sending Grok 3 prompt (length={len(prompt)} chars):")
     for i in range(0, len(prompt), 1000):
         logger.info(prompt[i:i+1000])
     log_prompt_to_file(prompt)
     
-    # 截斷 prompt 若超過 MAX_TOKENS
-    max_prompt_length = GROK3_API["MAX_TOKENS"] - 100  # 保留空間給輸出
+    max_prompt_length = GROK3_API["MAX_TOKENS"] - 100
     if len(prompt) > max_prompt_length:
         logger.warning(f"Prompt length ({len(prompt)}) exceeds MAX_TOKENS ({GROK3_API['MAX_TOKENS']}), truncating to {max_prompt_length} chars")
         prompt = prompt[:max_prompt_length] + "... [TRUNCATED]"
@@ -56,18 +55,20 @@ async def stream_grok3_response(prompt: str) -> AsyncGenerator[str, None]:
         "stream": True
     }
     
+    retry_options = aiohttp_retry.ExponentialRetry(attempts=3, start_timeout=30, factor=2.0, exceptions={aiohttp.ClientError, asyncio.TimeoutError})
     async with aiohttp.ClientSession() as session:
+        retry_client = aiohttp_retry.RetryClient(client_session=session, retry_options=retry_options)
         try:
-            async with session.post(
+            async with retry_client.post(
                 f"{GROK3_API['BASE_URL']}/completions",
                 headers=headers,
                 json=payload,
-                timeout=30
+                timeout=60
             ) as response:
                 if response.status != 200:
                     error_msg = await response.text()
                     logger.error(f"Grok 3 API request failed: status={response.status}, reason={error_msg}")
-                    yield f"Error: API request failed with status {response.status}"
+                    yield f"Error: API request failed with status {response.status}: {error_msg}"
                     return
                 
                 async for line in response.content:
@@ -84,6 +85,14 @@ async def stream_grok3_response(prompt: str) -> AsyncGenerator[str, None]:
                             logger.error(f"Error parsing Grok 3 response: {str(e)}")
                             yield f"Error: Failed to parse response - {str(e)}"
                             return
-        except Exception as e:
-            logger.error(f"Grok 3 API connection error: {str(e)}")
+        except aiohttp.ClientError as e:
+            logger.error(f"Grok 3 API connection error: type={type(e).__name__}, message={str(e)}")
             yield f"Error: API connection failed - {str(e)}"
+        except asyncio.TimeoutError as e:
+            logger.error(f"Grok 3 API timeout error: {str(e)}")
+            yield f"Error: API request timed out - {str(e)}"
+        except Exception as e:
+            logger.error(f"Grok 3 API unexpected error: type={type(e).__name__}, message={str(e)}")
+            yield f"Error: API unexpected error - {str(e)}"
+        finally:
+            await retry_client.close()

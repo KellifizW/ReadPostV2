@@ -4,6 +4,7 @@ import streamlit.logger
 import time
 import traceback
 from config import HKGOLDEN_API
+import streamlit as st
 
 logger = streamlit.logger.get_logger(__name__)
 
@@ -43,13 +44,24 @@ async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, req
     if HKGOLDEN_API.get("API_KEY"):
         headers["Authorization"] = f"Bearer {HKGOLDEN_API['API_KEY']}"
     
+    # 固定查詢參數，匹配高登熱 API 請求
+    query_params = {
+        "thumb": "Y",
+        "sort": "0",
+        "sensormode": "Y",
+        "filtermodeS": "N",
+        "hideblock": "N",
+        "limit": "-1"
+    }
+    
     async with aiohttp.ClientSession() as session:
         for page in range(start_page, start_page + max_pages):
-            url = f"{HKGOLDEN_API['BASE_URL']}/topics?cat_id={cat_id}&page={page}&sub_cat_id={sub_cat_id}"
+            url = f"{HKGOLDEN_API['BASE_URL']}/topics/{cat_id}/{page}"
             logger.info(f"Fetching cat_id={cat_id}, page={page}, url={url}")
             try:
-                async with session.get(url, headers=headers, timeout=10) as response:
+                async with session.get(url, headers=headers, params=query_params, timeout=10) as response:
                     request_counter += 1
+                    response_text = await response.text()
                     if response.status == 200:
                         data = await response.json()
                         if data.get("success"):
@@ -57,7 +69,7 @@ async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, req
                             logger.info(f"Fetched {len(data['items'])} items for cat_id={cat_id}, page={page}")
                         else:
                             error_msg = data.get("error", "Unknown error")
-                            logger.error(f"API returned failure: cat_id={cat_id}, page={page}, error={error_msg}, response={data}")
+                            logger.error(f"API returned failure: cat_id={cat_id}, page={page}, error={error_msg}, response={response_text[:200]}")
                             rate_limit_info.append(f"API error: {error_msg}")
                             break
                     elif response.status == 429:
@@ -67,11 +79,11 @@ async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, req
                         break
                     elif response.status == 404:
                         error_msg = f"HTTP 404: Category ID {cat_id} not found"
-                        logger.error(f"API request failed: cat_id={cat_id}, page={page}, status={response.status}, error={error_msg}")
+                        logger.error(f"API request failed: cat_id={cat_id}, page={page}, status={response.status}, error={error_msg}, response={response_text[:200]}")
                         rate_limit_info.append(error_msg)
                         break
                     else:
-                        error_msg = f"HTTP {response.status}: {await response.text()[:200]}"
+                        error_msg = f"HTTP {response.status}: {response_text[:200]}"
                         logger.error(f"API request failed: cat_id={cat_id}, page={page}, status={response.status}, error={error_msg}")
                         rate_limit_info.append(f"HTTP {response.status}: {error_msg}")
                         break
@@ -133,12 +145,23 @@ async def get_hkgolden_thread_content(thread_id, cat_id, request_counter=0, last
     if HKGOLDEN_API.get("API_KEY"):
         headers["Authorization"] = f"Bearer {HKGOLDEN_API['API_KEY']}"
     
+    # 固定查詢參數，與話題列表一致
+    query_params = {
+        "thumb": "Y",
+        "sort": "0",
+        "sensormode": "Y",
+        "filtermodeS": "N",
+        "hideblock": "N",
+        "limit": "-1"
+    }
+    
     async with aiohttp.ClientSession() as session:
-        url = f"{HKGOLDEN_API['BASE_URL']}/thread/{thread_id}?cat_id={cat_id}"
+        url = f"{HKGOLDEN_API['BASE_URL']}/thread/{thread_id}"
         logger.info(f"Fetching thread_id={thread_id}, url={url}")
         try:
-            async with session.get(url, headers=headers, timeout=10) as response:
+            async with session.get(url, headers=headers, params=query_params, timeout=10) as response:
                 request_counter += 1
+                response_text = await response.text()
                 if response.status == 200:
                     data = await response.json()
                     if data.get("success"):
@@ -148,14 +171,14 @@ async def get_hkgolden_thread_content(thread_id, cat_id, request_counter=0, last
                         logger.info(f"Fetched {len(replies)} replies for thread_id={thread_id}")
                     else:
                         error_msg = data.get("error", "Unknown error")
-                        logger.error(f"API returned failure: thread_id={thread_id}, error={error_msg}, response={data}")
+                        logger.error(f"API returned failure: thread_id={thread_id}, error={error_msg}, response={response_text[:200]}")
                         rate_limit_info.append(f"API error: {error_msg}")
                 elif response.status == 429:
                     rate_limit_until = time.time() + HKGOLDEN_API["RATE_LIMIT"]["PERIOD"]
                     logger.warning(f"Rate limit hit: thread_id={thread_id}, status=429")
                     rate_limit_info.append("Rate limit hit (429)")
                 else:
-                    error_msg = f"HTTP {response.status}: {await response.text()[:200]}"
+                    error_msg = f"HTTP {response.status}: {response_text[:200]}"
                     logger.error(f"API request failed: thread_id={thread_id}, status={response.status}, error={error_msg}")
                     rate_limit_info.append(f"HTTP {response.status}: {error_msg}")
         except (aiohttp.ClientConnectionError, aiohttp.ClientResponseError, aiohttp.ClientConnectorError, asyncio.TimeoutError) as e:

@@ -31,7 +31,7 @@ async def call_grok3_api(prompt, stream=False):
     }
     
     payload = {
-        "model": "grok-3",
+        "model": GROK3_API["MODEL"],
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": GROK3_API["MAX_TOKENS"],
         "stream": stream

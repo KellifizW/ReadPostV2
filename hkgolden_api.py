@@ -75,6 +75,13 @@ async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, req
                     rate_limit_until = time.time() + rate_limit_window
                     rate_limit_info.append(f"Rate limit reached: {request_counter} requests")
 
+                # 檢查 data["data"] 是否為列表或可迭代物件
+                if not isinstance(data["data"], (list, tuple)):
+                    error_msg = f"Unexpected data format for cat_id={cat_id}, page={page}, endpoint={endpoint}, data={data['data']}"
+                    logger.error(error_msg)
+                    rate_limit_info.append(error_msg)
+                    continue
+
                 for post in data["data"]:
                     try:
                         items.append({
@@ -86,7 +93,7 @@ async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, req
                             "like_count": int(post.get("like_count", 0)),
                             "dislike_count": int(post.get("dislike_count", 0))
                         })
-                    except (ValueError, TypeError) as e:
+                    except (ValueError, TypeError, AttributeError) as e:
                         logger.warning(f"Invalid post data: {post}, error={str(e)}")
                         continue
             else:

@@ -8,7 +8,7 @@ import time
 import random
 from datetime import datetime, timedelta
 import pytz
-from config import LIHKG_API, HKGOLDEN_API
+from config import LIHKG_API, HKGOLDEN_API, GENERAL
 from grok3_client import call_grok3_api
 import re
 from threading import Lock
@@ -18,9 +18,9 @@ import traceback
 logger = streamlit.logger.get_logger(__name__)
 processing_lock = Lock()
 active_requests = {}
-MAX_PROMPT_LENGTH = 30000
+MAX_PROMPT_LENGTH = GENERAL.get("MAX_PROMPT_LENGTH", 30000)
 THREAD_ID_CACHE_DURATION = 300
-HONG_KONG_TZ = pytz.timezone("Asia/Hong_Kong")
+HONG_KONG_TZ = pytz.timezone(GENERAL["TIMEZONE"])
 
 def clean_expired_cache(platform):
     cache_duration = LIHKG_API["CACHE_DURATION"] if platform == "LIHKG" else HKGOLDEN_API["CACHE_DURATION"]
@@ -67,8 +67,8 @@ async def analyze_user_question(question, platform):
         return {
             "intent": "unknown",
             "data_types": ["title", "no_of_reply", "last_reply_time", "replies"],
-            "num_threads": 3,  # 默認 3 個帖子
-            "reply_strategy": "最新10條",  # 默認最新 10 條回覆
+            "num_threads": 3,
+            "reply_strategy": "最新10條",
             "filter_condition": "按最後回覆時間排序"
         }
     
@@ -97,7 +97,6 @@ async def analyze_user_question(question, platform):
         elif line.startswith("篩選條件:"):
             filter_condition = line.replace("篩選條件:", "").strip()
     
-    # 優化「測試」輸入
     if question.strip().lower() == "測試":
         intent = "測試功能"
         num_threads = 3
@@ -157,7 +156,6 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
     analysis = await analyze_user_question(question, platform)
     logger.info(f"Question analysis: intent={analysis['intent']}, num_threads={analysis['num_threads']}, reply_strategy={analysis['reply_strategy']}")
     
-    # 驗證 cat_id
     try:
         cat_id = cat_id_map[selected_cat]
         if not isinstance(cat_id, (int, str)) or not cat_id:
@@ -174,7 +172,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
             active_requests[request_key]["result"] = result
         return result
     
-    max_pages = max(5, analysis["num_threads"])
+    max_pages = max(HKGOLDEN_API["MAX_PAGES"] if platform == "高登討論區" else LIHKG_API["MAX_PAGES"], analysis["num_threads"])
     logger.info(f"Fetching threads with reply_strategy={analysis['reply_strategy']}, cat_id={cat_id}")
     
     start_fetch_time = time.time()
@@ -224,7 +222,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
     
     if not items:
         logger.error(f"No items fetched from API: platform={platform}, cat_id={cat_id}")
-        error_message = f"無法抓取帖子，API 返回空數據。請檢查分類（{selected_cat}）或稍後重試。"
+        error_message = f"無法抓取帖子，API 返回空數據。請檢查分類（{selected_cat}，ID={cat_id}）或稍後重試。"
         if platform == "高登討論區":
             error_message += f"\n可能原因：分類 ID {cat_id} 無效或高登討論區 API 配置錯誤，請檢查 config.py 的 HKGOLDEN_API['CATEGORIES']。"
         result = {

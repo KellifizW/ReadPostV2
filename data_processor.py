@@ -9,11 +9,12 @@ import random
 from datetime import datetime, timedelta
 import pytz
 from config import LIHKG_API, HKGOLDEN_API
-from grok3_client import call_grok3_api
+from grok3_client import stream_grok3_response  # 修改導入
 import re
 from threading import Lock
 import aiohttp
 import json
+import traceback  # 添加 traceback 支援
 
 logger = streamlit.logger.get_logger(__name__)
 processing_lock = Lock()
@@ -60,10 +61,18 @@ async def analyze_user_question(question, platform):
 - 篩選條件: [描述或"無"]
 """
     logger.info(f"Analyzing user question: question={question}, platform={platform}")
-    api_result = await call_grok3_api(prompt, stream=False)
     
-    if api_result.get("status") == "error":
-        logger.error(f"Failed to analyze question: {api_result['content']}")
+    # 使用 stream_grok3_response 模擬非流式調用
+    content = ""
+    chunk_count = 0
+    try:
+        async for chunk in stream_grok3_response(prompt):
+            chunk_count += 1
+            content += chunk
+            logger.debug(f"Analysis chunk {chunk_count}: content={chunk[:50]}...")
+        logger.info(f"Analysis completed: chunk_count={chunk_count}, content_length={len(content)}")
+    except Exception as e:
+        logger.error(f"Failed to analyze question: error={str(e)}, traceback={traceback.format_exc()}")
         return {
             "intent": "unknown",
             "data_types": ["title", "no_of_reply", "replies"],
@@ -72,7 +81,7 @@ async def analyze_user_question(question, platform):
             "filter_condition": "none"
         }
     
-    content = api_result["content"].strip()
+    content = content.strip()
     logger.info(f"Analysis result: {content[:200]}...")
     
     intent = "unknown"
@@ -130,6 +139,8 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
     
     if "thread_id_cache" not in st.session_state:
         st.session_state.thread_id_cache = {}
+    if "thread_content_cache" not in st.session_state:
+        st.session_state.thread_content_cache = {}
     
     clean_expired_cache(platform)
     
@@ -163,7 +174,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
                 rate_limit_until=st.session_state.get("rate_limit_until", 0)
             )
     except Exception as e:
-        logger.error(f"Failed to fetch topics: error={str(e)}")
+        logger.error(f"Failed to fetch topics: error={str(e)}, traceback={traceback.format_exc()}")
         result = {
             "response": f"無法抓取帖子，API 錯誤：{str(e)}。請稍後重試。",
             "rate_limit_info": [],
@@ -246,7 +257,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
         try:
             thread_id = selected_item["thread_id"] if platform == "LIHKG" else selected_item["id"]
         except KeyError as e:
-            logger.error(f"Missing thread_id or id in selected_item: {selected_item}, error={str(e)}")
+            logger.error(f"Missing thread_id or id in selected_item: {selected_item}, error={str(e)}, traceback={traceback.format_exc()}")
             continue
         
         thread_title = selected_item["title"]
@@ -289,7 +300,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
                             max_replies=thread_max_replies
                         )
                 except Exception as e:
-                    logger.error(f"Failed to fetch thread content: thread_id={thread_id}, error={str(e)}")
+                    logger.error(f"Failed to fetch thread content: thread_id={thread_id}, error={str(e)}, traceback={traceback.format_exc()}")
                     continue
                 
                 replies = thread_result["replies"]
@@ -405,7 +416,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
 {{ output }}
 """
     
-    logger.info(f"Generated prompt (length={len(prompt)} chars)")
+    logger.info(f"Generated prompt (length={prompt_length} chars)")
     
     if return_prompt:
         result = {
@@ -419,66 +430,18 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
         return result
     
     start_api_time = time.time()
-    api_result = await call_grok3_api(prompt, stream=True)
-    api_elapsed = time.time() - start_api_time
-    logger.info(f"Grok 3 API call completed: elapsed={api_elapsed:.2f}s")
-    
+    # 使用 stream_grok3_response 進行流式調用
     async def stream_response():
-        if api_result.get("status") == "error":
-            logger.warning(f"Stream failed: request_key={request_key}, error={api_result['content']}")
-            for attempt in range(2):
-                logger.info(f"Retrying sync API call: attempt={attempt+1}, request_key={request_key}")
-                api_result_sync = await call_grok3_api(prompt, stream=False)
-                api_elapsed = time.time() - start_api_time
-                logger.info(f"Grok 3 API retry completed: elapsed={api_elapsed:.2f}s")
-                
-                if api_result_sync.get("status") != "error":
-                    break
-                logger.warning(f"Retry {attempt+1} failed: {api_result_sync['content']}")
-            
-            if api_result_sync.get("status") == "error":
-                logger.error(f"Retry failed: request_key={request_key}, error={api_result_sync['content']}")
-                yield f"無法生成回應，API 連接失敗：{api_result_sync['content']}\n"
-                return
-            
-            content = api_result_sync["content"]
-            content = re.sub(r'\{\{ output \}\}|\{ output \}', '', content).strip()
-            
-            share_text = ""
-            reason = ""
-            
-            share_match = re.search(r'分享文字：\s*(.*?)(?=\n*選擇理由：|\Z)', content, re.DOTALL)
-            reason_match = re.search(r'選擇理由：\s*(.*)', content, re.DOTALL)
-            
-            if share_match:
-                share_text = share_match.group(1).strip()
-            if reason_match:
-                reason = reason_match.group(1).strip()
-            
-            full_text = f"{share_text}\n\n{reason}" if reason else share_text
-            for i in range(0, len(full_text), 50):
-                yield full_text[i:i+50] + "\n"
-                await asyncio.sleep(0.1)
-            return
-        
+        chunk_count = 0
         buffer = ""
         try:
-            async for chunk in api_result["content"]:
+            async for chunk in stream_grok3_response(prompt):
+                chunk_count += 1
                 if chunk:
-                    logger.debug(f"Received chunk: {chunk[:50]}...")
-                    try:
-                        if chunk.strip() == "data: [DONE]":
-                            break
-                        if chunk.strip().startswith("data:"):
-                            json_data = json.loads(chunk.strip().replace("data: ", ""))
-                            if "choices" in json_data and json_data["choices"]:
-                                content = json_data["choices"][0].get("delta", {}).get("content", "")
-                                if content:
-                                    buffer += content
-                    except json.JSONDecodeError as e:
-                        logger.warning(f"Failed to parse JSON chunk: {chunk}, error={str(e)}")
-                        continue
+                    logger.debug(f"Stream chunk {chunk_count}: content={chunk[:50]}...")
+                    buffer += chunk
                     
+                    # 按行或 50 字分塊
                     while "\n" in buffer or len(buffer) >= 50:
                         if "\n" in buffer:
                             line, buffer = buffer.split("\n", 1)
@@ -492,13 +455,52 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
                         yield buffer + "\n"
                         buffer = ""
                         await asyncio.sleep(0.05)
+            if buffer:
+                yield buffer + "\n"
+            logger.info(f"Stream completed: chunk_count={chunk_count}, total_length={prompt_length + len(buffer)}")
         except (aiohttp.ClientConnectionError, aiohttp.ClientResponseError, aiohttp.ClientConnectorError, asyncio.TimeoutError) as e:
-            logger.error(f"Stream error in stream_response: request_key={request_key}, error={str(e)}")
+            logger.error(f"Stream error in stream_response: request_key={request_key}, chunk_count={chunk_count}, error={str(e)}, traceback={traceback.format_exc()}")
             yield f"無法生成回應，API 連接失敗：{str(e)}\n"
             return
         
-        if buffer:
-            yield buffer + "\n"
+        # 重試邏輯：若流式失敗，嘗試非流式調用
+        if chunk_count == 0:
+            logger.warning(f"Stream failed: request_key={request_key}, attempting non-stream retry")
+            for attempt in range(2):
+                logger.info(f"Retrying non-stream API call: attempt={attempt+1}, request_key={request_key}")
+                content = ""
+                retry_chunk_count = 0
+                try:
+                    async for chunk in stream_grok3_response(prompt):
+                        retry_chunk_count += 1
+                        content += chunk
+                        logger.debug(f"Retry chunk {retry_chunk_count}: content={chunk[:50]}...")
+                    logger.info(f"Non-stream retry completed: attempt={attempt+1}, chunk_count={retry_chunk_count}, content_length={len(content)}")
+                    
+                    content = re.sub(r'\{\{ output \}\}|\{ output \}', '', content).strip()
+                    share_text = ""
+                    reason = ""
+                    
+                    share_match = re.search(r'分享文字：\s*(.*?)(?=\n*選擇理由：|\Z)', content, re.DOTALL)
+                    reason_match = re.search(r'選擇理由：\s*(.*)', content, re.DOTALL)
+                    
+                    if share_match:
+                        share_text = share_match.group(1).strip()
+                    if reason_match:
+                        reason = reason_match.group(1).strip()
+                    
+                    full_text = f"{share_text}\n\n{reason}" if reason else share_text
+                    for i in range(0, len(full_text), 50):
+                        yield full_text[i:i+50] + "\n"
+                        await asyncio.sleep(0.1)
+                    return
+                except Exception as e:
+                    logger.warning(f"Retry {attempt+1} failed: error={str(e)}, traceback={traceback.format_exc()}")
+                    continue
+            yield f"無法生成回應，API 連接失敗：多次重試失敗\n"
+    
+    api_elapsed = time.time() - start_api_time
+    logger.info(f"Grok 3 API call completed: elapsed={api_elapsed:.2f}s")
     
     result = {
         "response": stream_response(),

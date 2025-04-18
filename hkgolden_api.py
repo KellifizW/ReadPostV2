@@ -4,138 +4,107 @@ import streamlit.logger
 import time
 import traceback
 from config import HKGOLDEN_API
-import streamlit as st
-import json
-from datetime import datetime
 
 logger = streamlit.logger.get_logger(__name__)
 
-async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, request_counter=0, last_reset=0, rate_limit_until=0):
+async def fetch_with_retry(session, url, headers, params, retries=3, backoff_factor=1):
+    for attempt in range(retries):
+        try:
+            async with session.get(url, headers=headers, params=params, timeout=10) as response:
+                if response.status == 429:
+                    retry_after = int(response.headers.get("Retry-After", 60))
+                    logger.warning(f"Rate limit hit for {url}, retrying after {retry_after}s")
+                    await asyncio.sleep(retry_after)
+                    continue
+                response.raise_for_status()
+                data = await response.json()
+                logger.debug(f"Raw response from {url}: {data}")
+                return data, response.status
+        except (aiohttp.ClientResponseError, aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
+            logger.warning(f"Attempt {attempt + 1}/{retries} failed for {url}: {str(e)}")
+            if attempt < retries - 1:
+                await asyncio.sleep(backoff_factor * (2 ** attempt))
+            else:
+                logger.error(f"All {retries} attempts failed for {url}: {str(e)}, traceback={traceback.format_exc()}")
+                return None, response.status if 'response' in locals() else 500
+    return None, 500
+
+async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, request_counter, last_reset, rate_limit_until):
     if time.time() < rate_limit_until:
-        logger.warning(f"Rate limit in effect until {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(rate_limit_until))}")
+        logger.warning(f"Rate limit active until {time.ctime(rate_limit_until)}, skipping request")
         return {
             "items": [],
-            "rate_limit_info": [f"Rate limit until {rate_limit_until}"],
+            "rate_limit_info": [f"Rate limit active until {time.ctime(rate_limit_until)}"],
             "request_counter": request_counter,
             "last_reset": last_reset,
             "rate_limit_until": rate_limit_until
         }
-    
-    current_time = time.time()
-    if current_time - last_reset > HKGOLDEN_API["RATE_LIMIT"]["PERIOD"]:
-        request_counter = 0
-        last_reset = current_time
-    
-    if request_counter >= HKGOLDEN_API["RATE_LIMIT"]["MAX_REQUESTS"]:
-        rate_limit_until = last_reset + HKGOLDEN_API["RATE_LIMIT"]["PERIOD"]
-        logger.warning(f"Rate limit reached: {request_counter}/{HKGOLDEN_API['RATE_LIMIT']['MAX_REQUESTS']} requests")
-        return {
-            "items": [],
-            "rate_limit_info": [f"Rate limit reached: {request_counter}/{HKGOLDEN_API['RATE_LIMIT']['MAX_REQUESTS']} requests"],
-            "request_counter": request_counter,
-            "last_reset": last_reset,
-            "rate_limit_until": rate_limit_until
-        }
-    
+
+    base_url = HKGOLDEN_API["BASE_URL"]
+    headers = {"User-Agent": HKGOLDEN_API.get("USER_AGENT", "Streamlit-App/1.0")}
     items = []
     rate_limit_info = []
-    headers = {
-        "User-Agent": "Streamlit-App/1.0",
-        "Accept": "application/json"
-    }
-    if HKGOLDEN_API.get("API_KEY"):
-        headers["Authorization"] = f"Bearer {HKGOLDEN_API['API_KEY']}"
-    
-    query_params = {
-        "thumb": "Y",
-        "sort": "0",
-        "sensormode": "Y",
-        "filtermodeS": "N",
-        "hideblock": "N",
-        "limit": "-1"
-    }
-    
+    api_key = HKGOLDEN_API.get("API_KEY")
+
     async with aiohttp.ClientSession() as session:
         for page in range(start_page, start_page + max_pages):
-            url = f"{HKGOLDEN_API['BASE_URL']}/topics/{cat_id}/{page}"
-            logger.info(f"Fetching cat_id={cat_id}, page={page}, url={url}")
-            try:
-                async with session.get(url, headers=headers, params=query_params, timeout=10) as response:
-                    request_counter += 1
-                    response_text = await response.text()
-                    if response.status == 200:
-                        data = await response.json()
-                        logger.debug(f"API response: {json.dumps(data, ensure_ascii=False)[:1000]}...")
-                        if data.get("result"):
-                            post_list = data.get("data", {}).get("list", [])
-                            logger.info(f"Found {len(post_list)} posts in post_list for cat_id={cat_id}, page={page}")
-                            if not post_list:
-                                error_msg = f"No posts found in–
+            query_params = {
+                "thumb": "Y",
+                "sort": "0",
+                "sensormode": "Y",
+                "filtermodeS": "N",
+                "hideblock": "N",
+                "page": str(page),
+                "limit": "-1"
+            }
+            if api_key:
+                query_params["access_token"] = api_key
 
- data.data.list for cat_id={cat_id}, page={page}"
-                                logger.warning(error_msg)
-                                rate_limit_info.append(error_msg)
-                                break
-                            for post in post_list:
-                                logger.debug(f"Raw post data: {json.dumps(post, ensure_ascii=False)[:500]}...")
-                                # 解析時間戳
-                                order_date = post.get("orderDate", post.get("last_reply", 0))
-                                last_reply_time = order_date // 1000 if order_date > 1000000000000 else order_date
-                                # 驗證時間戳
-                                try:
-                                    parsed_time = datetime.fromtimestamp(last_reply_time).strftime('%Y-%m-%d %H:%M:%S')
-                                    logger.debug(f"Post ID={post.get('id', 'unknown')}, orderDate={order_date}, parsed_time={parsed_time}")
-                                except (ValueError, OSError) as e:
-                                    logger.warning(f"Invalid timestamp for post ID={post.get('id', 'unknown')}: orderDate={order_date}, error={str(e)}")
-                                    last_reply_time = 0
-                                item = {
-                                    "id": post.get("id", post.get("post_id", "")),
-                                    "title": post.get("title", post.get("subject", "")),
-                                    "no_of_reply": post.get("no_of_reply", post.get("reply_count", 0)),
-                                    "last_reply_time": last_reply_time,
-                                    "like_count": post.get("like_count", post.get("likes", 0)),
-                                    "dislike_count": post.get("dislike_count", post.get("dislikes", 0))
-                                }
-                                if not item["id"] or not item["title"]:
-                                    logger.warning(f"Missing key fields in post: id={item['id']}, title={item['title']}, raw_post={json.dumps(post, ensure_ascii=False)[:200]}")
-                                    continue
-                                items.append(item)
-                            logger.info(f"Fetched {len(items)} valid items for cat_id={cat_id}, page={page}")
-                        else:
-                            error_msg = data.get("error", "Unknown error")
-                            logger.error(f"API returned failure: cat_id={cat_id}, page={page}, error={error_msg}, response={response_text[:200]}")
-                            rate_limit_info.append(f"API error: {error_msg}")
-                            break
-                    elif response.status == 429:
-                        rate_limit_until = time.time() + HKGOLDEN_API["RATE_LIMIT"]["PERIOD"]
-                        logger.warning(f"Rate limit hit: cat_id={cat_id}, page={page}, status=429")
-                        rate_limit_info.append("Rate limit hit (429)")
+            endpoints = [
+                f"{base_url}/v1/topics/{cat_id}",
+                f"{base_url}/v1/threads/{cat_id}",
+                f"{base_url}/v1/thread"
+            ]
+
+            for endpoint in endpoints:
+                data, status = await fetch_with_retry(session, endpoint, headers, query_params)
+                logger.debug(f"Tried endpoint {endpoint}, status={status}, data={data}")
+
+                if data and data.get("data"):
+                    request_counter += 1
+                    if request_counter >= HKGOLDEN_API["RATE_LIMIT_REQUESTS"]:
+                        rate_limit_until = time.time() + HKGOLDEN_API["RATE_LIMIT_WINDOW"]
+                        rate_limit_info.append(f"Rate limit reached: {request_counter} requests")
+
+                    for post in data["data"]:
+                        try:
+                            items.append({
+                                "id": post.get("thread_id", post.get("id", "")),
+                                "title": post.get("title", ""),
+                                "no_of_reply": int(post.get("no_of_reply", 0)),
+                                "create_time": int(post.get("create_time", 0)) / 1000,
+                                "last_reply_time": int(post.get("orderDate", 0)) / 1000,
+                                "like_count": int(post.get("like_count", 0)),
+                                "dislike_count": int(post.get("dislike_count", 0))
+                            })
+                        except (ValueError, TypeError) as e:
+                            logger.warning(f"Invalid post data: {post}, error={str(e)}")
+                            continue
+
+                    if len(items) >= 10:
                         break
-                    elif response.status == 404:
-                        error_msg = f"HTTP 404: Category ID {cat_id} not found"
-                        logger.error(f"API request failed: cat_id={cat_id}, page={page}, status={response.status}, error={error_msg}, response={response_text[:200]}")
-                        rate_limit_info.append(error_msg)
-                        break
-                    else:
-                        error_msg = f"HTTP {response.status}: {response_text[:200]}"
-                        logger.error(f"API request failed: cat_id={cat_id}, page={page}, status={response.status}, error={error_msg}")
-                        rate_limit_info.append(f"HTTP {response.status}: {error_msg}")
-                        break
-            except (aiohttp.ClientConnectionError, aiohttp.ClientResponseError, aiohttp.ClientConnectorError, asyncio.TimeoutError) as e:
-                logger.error(f"Failed to fetch cat_id={cat_id}, page={page}, error={str(e)}, traceback={traceback.format_exc()}")
-                rate_limit_info.append(f"Request failed: {str(e)}")
+                else:
+                    error_msg = f"No posts found in response for cat_id={cat_id}, start_page={page}, max_pages={max_pages}"
+                    logger.error(error_msg)
+                    rate_limit_info.append(error_msg)
+
+            if len(items) >= 10:
                 break
-            except Exception as e:
-                logger.error(f"Unexpected error fetching cat_id={cat_id}, page={page}, error={str(e)}, traceback={traceback.format_exc()}")
-                rate_limit_info.append(f"Unexpected error: {str(e)}")
-                break
-            await asyncio.sleep(HKGOLDEN_API["REQUEST_DELAY"])
-    
-    if not items:
-        error_msg = f"No valid posts fetched for cat_id={cat_id}. Check API response fields or query parameters."
-        logger.error(error_msg)
-        rate_limit_info.append(error_msg)
-    
+
+        if time.time() - last_reset > HKGOLDEN_API["RATE_LIMIT_WINDOW"]:
+            request_counter = 0
+            last_reset = time.time()
+
     return {
         "items": items,
         "rate_limit_info": rate_limit_info,
@@ -144,126 +113,82 @@ async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, req
         "rate_limit_until": rate_limit_until
     }
 
-async def get_hkgolden_thread_content(thread_id, cat_id, request_counter=0, last_reset=0, rate_limit_until=0, max_replies=100):
+async def get_hkgolden_thread_content(thread_id, cat_id, request_counter, last_reset, rate_limit_until, max_replies):
     if time.time() < rate_limit_until:
-        logger.warning(f"Rate limit in effect until {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(rate_limit_until))}")
+        logger.warning(f"Rate limit active until {time.ctime(rate_limit_until)}, skipping thread request")
         return {
             "replies": [],
             "title": "",
             "total_replies": 0,
-            "rate_limit_info": [f"Rate limit until {rate_limit_until}"],
+            "rate_limit_info": [f"Rate limit active until {time.ctime(rate_limit_until)}"],
             "request_counter": request_counter,
             "last_reset": last_reset,
             "rate_limit_until": rate_limit_until
         }
-    
-    current_time = time.time()
-    if current_time - last_reset > HKGOLDEN_API["RATE_LIMIT"]["PERIOD"]:
-        request_counter = 0
-        last_reset = current_time
-    
-    if request_counter >= HKGOLDEN_API["RATE_LIMIT"]["MAX_REQUESTS"]:
-        rate_limit_until = last_reset + HKGOLDEN_API["RATE_LIMIT"]["PERIOD"]
-        logger.warning(f"Rate limit reached: {request_counter}/{HKGOLDEN_API['RATE_LIMIT']['MAX_REQUESTS']} requests")
-        return {
-            "replies": [],
-            "title": "",
-            "total_replies": 0,
-            "rate_limit_info": [f"Rate limit reached: {request_counter}/{HKGOLDEN_API['RATE_LIMIT']['MAX_REQUESTS']} requests"],
-            "request_counter": request_counter,
-            "last_reset": last_reset,
-            "rate_limit_until": rate_limit_until
-        }
-    
-    replies = []
+
+    base_url = HKGOLDEN_API["BASE_URL"]
+    headers = {"User-Agent": HKGOLDEN_API.get("USER_AGENT", "Streamlit-App/1.0")}
     rate_limit_info = []
-    headers = {
-        "User-Agent": "Streamlit-App/1.0",
-        "Accept": "application/json"
-    }
-    if HKGOLDEN_API.get("API_KEY"):
-        headers["Authorization"] = f"Bearer {HKGOLDEN_API['API_KEY']}"
-    
-    query_params = {
-        "thumb": "Y",
-        "sort": "0",
-        "sensormode": "Y",
-        "filtermodeS": "N",
-        "hideblock": "N",
-        "limit": "-1"
-    }
-    
+    api_key = HKGOLDEN_API.get("API_KEY")
+    replies = []
+    title = ""
+
     async with aiohttp.ClientSession() as session:
-        # 嘗試多個可能的端點
+        query_params = {
+            "thumb": "Y",
+            "sort": "0",
+            "sensormode": "Y",
+            "filtermodeS": "N",
+            "hideblock": "N",
+            "limit": str(max_replies) if max_replies > 0 else "-1"
+        }
+        if api_key:
+            query_params["access_token"] = api_key
+
         endpoints = [
-            f"{HKGOLDEN_API['BASE_URL']}/thread/{thread_id}",
-            f"{HKGOLDEN_API['BASE_URL']}/threads/{thread_id}",
-            f"{HKGOLDEN_API['BASE_URL']}/topic/{thread_id}"
+            f"{base_url}/v1/thread/{thread_id}",
+            f"{base_url}/v1/threads/{thread_id}",
+            f"{base_url}/v1/posts/{thread_id}"
         ]
-        for url in endpoints:
-            logger.info(f"Fetching thread_id={thread_id}, url={url}")
-            try:
-                async with session.get(url, headers=headers, params=query_params, timeout=10) as response:
-                    request_counter += 1
-                    response_text = await response.text()
-                    if response.status == 200:
-                        data = await response.json()
-                        logger.debug(f"Thread API response: {json.dumps(data, ensure_ascii=False)[:1000]}...")
-                        if data.get("result"):
-                            reply_list = data.get("data", {}).get("replies", [])[:max_replies]
-                            logger.info(f"Found {len(reply_list)} replies for thread_id={thread_id}")
-                            for reply in reply_list:
-                                reply_data = {
-                                    "msg": reply.get("content", reply.get("message", ""))
-                                }
-                                if not reply_data["msg"]:
-                                    logger.warning(f"Missing content in reply: raw_reply={json.dumps(reply, ensure_ascii=False)[:200]}")
-                                    continue
-                                replies.append(reply_data)
-                            title = data.get("data", {}).get("title", data.get("data", {}).get("subject", ""))
-                            total_replies = data.get("data", {}).get("total_replies", len(replies))
-                            logger.info(f"Fetched {len(replies)} valid replies for thread_id={thread_id}")
-                            return {
-                                "replies": replies,
-                                "title": title,
-                                "total_replies": total_replies,
-                                "rate_limit_info": rate_limit_info,
-                                "request_counter": request_counter,
-                                "last_reset": last_reset,
-                                "rate_limit_until": rate_limit_until
-                            }
-                        else:
-                            error_msg = data.get("error", "Unknown error")
-                            logger.error(f"API returned failure: thread_id={thread_id}, error={error_msg}, response={response_text[:200]}")
-                            rate_limit_info.append(f"API error: {error_msg}")
-                    elif response.status == 429:
-                        rate_limit_until = time.time() + HKGOLDEN_API["RATE_LIMIT"]["PERIOD"]
-                        logger.warning(f"Rate limit hit: thread_id={thread_id}, status=429")
-                        rate_limit_info.append("Rate limit hit (429)")
-                        break
-                    elif response.status == 404:
-                        error_msg = f"HTTP 404: Thread ID {thread_id} not found at {url}"
-                        logger.error(f"API request failed: thread_id={thread_id}, status={response.status}, error={error_msg}")
-                        rate_limit_info.append(error_msg)
-                    else:
-                        error_msg = f"HTTP {response.status}: {response_text[:200]}"
-                        logger.error(f"API request failed: thread_id={thread_id}, status={response.status}, error={error_msg}")
-                        rate_limit_info.append(f"HTTP {response.status}: {error_msg}")
-            except (aiohttp.ClientConnectionError, aiohttp.ClientResponseError, aiohttp.ClientConnectorError, asyncio.TimeoutError) as e:
-                logger.error(f"Failed to fetch thread_id={thread_id}, url={url}, error={str(e)}, traceback={traceback.format_exc()}")
-                rate_limit_info.append(f"Request failed: {str(e)}")
-            except Exception as e:
-                logger.error(f"Unexpected error fetching thread_id={thread_id}, url={url}, error={str(e)}, traceback={traceback.format_exc()}")
-                rate_limit_info.append(f"Unexpected error: {str(e)}")
-    
-    error_msg = f"No valid thread content fetched for thread_id={thread_id}. All endpoints failed."
-    logger.error(error_msg)
-    rate_limit_info.append(error_msg)
-    
+
+        for endpoint in endpoints:
+            data, status = await fetch_with_retry(session, endpoint, headers, query_params)
+            logger.debug(f"Tried thread endpoint {endpoint}, status={status}, data={data}")
+
+            if data and data.get("data"):
+                request_counter += 1
+                if request_counter >= HKGOLDEN_API["RATE_LIMIT_REQUESTS"]:
+                    rate_limit_until = time.time() + HKGOLDEN_API["RATE_LIMIT_WINDOW"]
+                    rate_limit_info.append(f"Rate limit reached: {request_counter} requests")
+
+                try:
+                    title = data["data"].get("title", "")
+                    total_replies = int(data["data"].get("no_of_reply", 0))
+                    for reply in data["data"].get("replies", []):
+                        msg = reply.get("message", reply.get("msg", ""))
+                        if msg:
+                            replies.append({
+                                "msg": msg,
+                                "reply_time": int(reply.get("time", 0)) / 1000
+                            })
+                    break
+                except (ValueError, TypeError, KeyError) as e:
+                    logger.error(f"Invalid thread data for thread_id={thread_id}: {str(e)}, data={data}")
+                    rate_limit_info.append(f"Invalid thread data: {str(e)}")
+                    continue
+            else:
+                error_msg = f"Thread fetch failed for thread_id={thread_id}, endpoint={endpoint}, status={status}"
+                logger.error(error_msg)
+                rate_limit_info.append(error_msg)
+
+        if time.time() - last_reset > HKGOLDEN_API["RATE_LIMIT_WINDOW"]:
+            request_counter = 0
+            last_reset = time.time()
+
     return {
-        "replies": [],
-        "title": "",
-        "total_replies": 0,
+        "replies": replies[:max_replies] if max_replies > 0 else replies,
+        "title": title,
+        "total_replies": len(replies),
         "rate_limit_info": rate_limit_info,
         "request_counter": request_counter,
         "last_reset": last_reset,

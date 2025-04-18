@@ -9,17 +9,16 @@ import random
 from datetime import datetime, timedelta
 import pytz
 from config import LIHKG_API, HKGOLDEN_API
-from grok3_client import stream_grok3_response
+from grok3_client import call_grok3_api
 import re
 from threading import Lock
 import aiohttp
-import json
 import traceback
 
 logger = streamlit.logger.get_logger(__name__)
 processing_lock = Lock()
 active_requests = {}
-MAX_PROMPT_LENGTH = 10000
+MAX_PROMPT_LENGTH = 30000
 THREAD_ID_CACHE_DURATION = 300
 HONG_KONG_TZ = pytz.timezone("Asia/Hong_Kong")
 
@@ -61,33 +60,26 @@ async def analyze_user_question(question, platform):
 - 篩選條件: [描述或"無"]
 """
     logger.info(f"Analyzing user question: question={question}, platform={platform}")
+    api_result = await call_grok3_api(prompt, stream=False)
     
-    content = ""
-    chunk_count = 0
-    try:
-        async for chunk in stream_grok3_response(prompt):
-            chunk_count += 1
-            content += chunk
-            logger.debug(f"Analysis chunk {chunk_count}: content={chunk[:50]}...")
-        logger.info(f"Analysis completed: chunk_count={chunk_count}, content_length={len(content)}")
-    except Exception as e:
-        logger.error(f"Failed to analyze question: error={str(e)}, traceback={traceback.format_exc()}")
+    if api_result.get("status") == "error":
+        logger.error(f"Failed to analyze question: {api_result['content']}, traceback={traceback.format_exc()}")
         return {
             "intent": "unknown",
-            "data_types": ["title", "no_of_reply", "replies"],
-            "num_threads": 1,
-            "reply_strategy": "全部回覆",
-            "filter_condition": "none"
+            "data_types": ["title", "no_of_reply", "last_reply_time", "replies"],
+            "num_threads": 3,  # 默認 3 個帖子
+            "reply_strategy": "最新10條",  # 默認最新 10 條回覆
+            "filter_condition": "按最後回覆時間排序"
         }
     
-    content = content.strip()
+    content = api_result["content"].strip()
     logger.info(f"Analysis result: {content[:200]}...")
     
     intent = "unknown"
-    data_types = ["title", "no_of_reply", "last_reply_time"]
-    num_threads = 1
-    reply_strategy = "無需抓取回覆內容"
-    filter_condition = "none"
+    data_types = ["title", "no_of_reply", "last_reply_time", "replies"]
+    num_threads = 3
+    reply_strategy = "最新10條"
+    filter_condition = "按最後回覆時間排序"
     
     for line in content.split("\n"):
         line = line.strip()
@@ -105,9 +97,28 @@ async def analyze_user_question(question, platform):
         elif line.startswith("篩選條件:"):
             filter_condition = line.replace("篩選條件:", "").strip()
     
-    if "on9" in question.lower():
+    # 優化「測試」輸入
+    if question.strip().lower() == "測試":
+        intent = "測試功能"
+        num_threads = 3
+        reply_strategy = "最新10條"
+        filter_condition = "按最後回覆時間排序，選擇近期活躍帖子"
+    elif "分享" in question.lower() or "排列" in question.lower():
+        match = re.search(r'(\d+)[個个]', question)
+        if match:
+            num_threads = min(max(int(match.group(1)), 1), 10)
+            intent = "分享最新帖子" if "分享" in question.lower() else "排列最新帖子"
+        elif "幾個" in question.lower():
+            num_threads = max(num_threads, 3)
+            intent = "分享最新帖子"
+    elif "最新" in question.lower() or "時間" in question.lower():
+        intent = "排列最新帖子"
+        filter_condition = "按最後回覆時間排序，選擇最新的帖子"
+        data_types.extend(["like_count", "dislike_count"])
+        reply_strategy = "無需抓取回覆內容" if "排列" in question.lower() else "最新50條"
+    elif "on9" in question.lower():
         intent = "尋找on9帖子"
-        data_types = ["title", "no_of_reply", "last_reply_time", "like_count", "dislike_count", "replies"]
+        data_types.extend(["like_count", "dislike_count"])
         num_threads = 5
         reply_strategy = "最新20條"
         filter_condition = "按回覆數量排序，標題或回覆包含‘on9’或搞笑、荒謬、惡搞、迷因、傻、無語、荒唐相關內容，優先今日帖子但允許最近三天"
@@ -123,7 +134,7 @@ async def analyze_user_question(question, platform):
         "filter_condition": filter_condition
     }
 
-async def process_user_question(question, platform, cat_id_map, selected_cat, return_prompt=False, request_counter=0, last_reset=0, rate_limit_until=0):
+async def process_user_question(question, platform, cat_id_map, selected_cat, return_prompt=False):
     request_key = f"{question}:{platform}:{selected_cat}:{'preview' if return_prompt else 'normal'}"
     current_time = time.time()
     
@@ -134,7 +145,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
         
         active_requests[request_key] = {"timestamp": current_time, "result": None}
     
-    logger.info(f"Starting to process question: request_key={request_key}, hk_time={datetime.now(HONG_KONG_TZ).strftime('%Y-%m-%d %H:%M:%S')}, request_counter={request_counter}")
+    logger.info(f"Starting to process question: request_key={request_key}, hk_time={datetime.now(HONG_KONG_TZ).strftime('%Y-%m-%d %H:%M:%S')}")
     
     if "thread_id_cache" not in st.session_state:
         st.session_state.thread_id_cache = {}
@@ -146,19 +157,18 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
     analysis = await analyze_user_question(question, platform)
     logger.info(f"Question analysis: intent={analysis['intent']}, num_threads={analysis['num_threads']}, reply_strategy={analysis['reply_strategy']}")
     
-    # 確保 cat_id 是整數
+    # 驗證 cat_id
     try:
-        cat_id = int(cat_id_map[selected_cat])
-    except (ValueError, TypeError) as e:
+        cat_id = cat_id_map[selected_cat]
+        if not isinstance(cat_id, (int, str)) or not cat_id:
+            raise ValueError(f"Invalid cat_id: {cat_id}")
+    except (KeyError, ValueError) as e:
         logger.error(f"Invalid cat_id: cat_id_map={cat_id_map}, selected_cat={selected_cat}, error={str(e)}, traceback={traceback.format_exc()}")
         result = {
-            "response": f"無效分類 ID：{cat_id_map[selected_cat]}。請檢查分類配置。",
+            "response": f"無效分類 ID：{selected_cat}（{cat_id_map.get(selected_cat, '未知')}）。請檢查 {platform} 分類配置。",
             "rate_limit_info": [],
             "processed_data": [],
-            "analysis": analysis,
-            "request_counter": request_counter,
-            "last_reset": last_reset,
-            "rate_limit_until": rate_limit_until
+            "analysis": analysis
         }
         with processing_lock:
             active_requests[request_key]["result"] = result
@@ -175,9 +185,9 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
                 sub_cat_id=0,
                 start_page=1,
                 max_pages=max_pages,
-                request_counter=request_counter,
-                last_reset=last_reset,
-                rate_limit_until=rate_limit_until
+                request_counter=st.session_state.get("request_counter", 0),
+                last_reset=st.session_state.get("last_reset", time.time()),
+                rate_limit_until=st.session_state.get("rate_limit_until", 0)
             )
         else:
             result = await get_hkgolden_topic_list(
@@ -185,20 +195,20 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
                 sub_cat_id=0,
                 start_page=1,
                 max_pages=max_pages,
-                request_counter=request_counter,
-                last_reset=last_reset,
-                rate_limit_until=rate_limit_until
+                request_counter=st.session_state.get("request_counter", 0),
+                last_reset=st.session_state.get("last_reset", time.time()),
+                rate_limit_until=st.session_state.get("rate_limit_until", 0)
             )
     except Exception as e:
-        logger.error(f"Failed to fetch topics: error={str(e)}, traceback={traceback.format_exc()}")
+        logger.error(f"Failed to fetch topics: platform={platform}, cat_id={cat_id}, error={str(e)}, traceback={traceback.format_exc()}")
+        error_message = f"無法抓取帖子，API 錯誤：{str(e)}。"
+        if platform == "高登討論區":
+            error_message += f"\n可能原因：分類 ID {cat_id} 無效或高登討論區 API 配置錯誤，請檢查 config.py 的 HKGOLDEN_API['CATEGORIES']。"
         result = {
-            "response": f"無法抓取帖子，API 錯誤：{str(e)}。請稍後重試。",
+            "response": error_message,
             "rate_limit_info": [],
             "processed_data": [],
-            "analysis": analysis,
-            "request_counter": request_counter,
-            "last_reset": last_reset,
-            "rate_limit_until": rate_limit_until
+            "analysis": analysis
         }
         with processing_lock:
             active_requests[request_key]["result"] = result
@@ -206,22 +216,22 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
     
     items = result["items"]
     rate_limit_info = result["rate_limit_info"]
-    request_counter = result["request_counter"]
-    last_reset = result["last_reset"]
-    rate_limit_until = result["rate_limit_until"]
+    st.session_state.request_counter = result["request_counter"]
+    st.session_state.last_reset = result["last_reset"]
+    st.session_state.rate_limit_until = result["rate_limit_until"]
     
     logger.info(f"Fetch completed: platform={platform}, category={selected_cat}, total_items={len(items)}, elapsed={time.time() - start_fetch_time:.2f}s")
     
     if not items:
-        logger.error("No items fetched from API")
+        logger.error(f"No items fetched from API: platform={platform}, cat_id={cat_id}")
+        error_message = f"無法抓取帖子，API 返回空數據。請檢查分類（{selected_cat}）或稍後重試。"
+        if platform == "高登討論區":
+            error_message += f"\n可能原因：分類 ID {cat_id} 無效或高登討論區 API 配置錯誤，請檢查 config.py 的 HKGOLDEN_API['CATEGORIES']。"
         result = {
-            "response": f"無法抓取帖子，API 返回空數據。請檢查分類（{selected_cat}）或稍後重試。",
+            "response": error_message,
             "rate_limit_info": rate_limit_info,
             "processed_data": [],
-            "analysis": analysis,
-            "request_counter": request_counter,
-            "last_reset": last_reset,
-            "rate_limit_until": rate_limit_until
+            "analysis": analysis
         }
         with processing_lock:
             active_requests[request_key]["result"] = result
@@ -253,6 +263,12 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
             key=lambda x: x.get("no_of_reply", 0),
             reverse=True
         )
+    elif "按最後回覆時間排序" in filter_condition:
+        selected_items = sorted(
+            filtered_items,
+            key=lambda x: x.get("last_reply_time", 0),
+            reverse=True
+        )
     else:
         selected_items = sorted(
             filtered_items,
@@ -266,7 +282,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
         logger.warning("No threads match filter conditions, falling back to default sorting")
         selected_items = sorted(
             items,
-            key=lambda x: x.get("no_of_reply", 0),
+            key=lambda x: x.get("last_reply_time", 0),
             reverse=True
         )[:analysis["num_threads"]]
     
@@ -299,7 +315,8 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
                 total_replies = thread_data["total_replies"]
                 rate_limit_info.extend(thread_data.get("rate_limit_info", []))
             else:
-                thread_max_replies = min(no_of_reply, 20) if "最新20條" in analysis["reply_strategy"] else no_of_reply
+                thread_max_replies = min(no_of_reply, 10) if "最新10條" in analysis["reply_strategy"] else \
+                                    min(no_of_reply, 50) if "最新50條" in analysis["reply_strategy"] else no_of_reply
                 logger.info(f"Fetching thread content: thread_id={thread_id}, platform={platform}, max_replies={thread_max_replies}")
                 
                 try:
@@ -307,18 +324,18 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
                         thread_result = await get_lihkg_thread_content(
                             thread_id=thread_id,
                             cat_id=cat_id,
-                            request_counter=request_counter,
-                            last_reset=last_reset,
-                            rate_limit_until=rate_limit_until,
+                            request_counter=st.session_state.request_counter,
+                            last_reset=st.session_state.last_reset,
+                            rate_limit_until=st.session_state.rate_limit_until,
                             max_replies=thread_max_replies
                         )
                     else:
                         thread_result = await get_hkgolden_thread_content(
                             thread_id=thread_id,
                             cat_id=cat_id,
-                            request_counter=request_counter,
-                            last_reset=last_reset,
-                            rate_limit_until=rate_limit_until,
+                            request_counter=st.session_state.request_counter,
+                            last_reset=st.session_state.last_reset,
+                            rate_limit_until=st.session_state.rate_limit_until,
                             max_replies=thread_max_replies
                         )
                 except Exception as e:
@@ -329,9 +346,9 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
                 thread_title = thread_result["title"] or thread_title
                 total_replies = thread_result.get("total_replies", no_of_reply)
                 rate_limit_info.extend(thread_result["rate_limit_info"])
-                request_counter = thread_result["request_counter"]
-                last_reset = thread_result["last_reset"]
-                rate_limit_until = thread_result["rate_limit_until"]
+                st.session_state.request_counter = thread_result["request_counter"]
+                st.session_state.last_reset = thread_result["last_reset"]
+                st.session_state.rate_limit_until = thread_result["rate_limit_until"]
                 
                 logger.info(f"Thread content fetched: thread_id={thread_id}, title={thread_title}, replies={len(replies)}")
                 
@@ -421,14 +438,14 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
             if reply_count < max_replies:
                 prompt += f"  - [因長度限制，僅顯示前 {reply_count} 條回覆，總共 {max_replies} 條]\n"
         else:
-            prompt += "- 回覆：無（未找到符合‘on9’或搞笑相關內容的回覆）\n"
+            prompt += "- 回覆：無（未找到符合條件的回覆）\n"
     
     prompt_length = len(prompt)
     
     prompt += f"""
 請完成以下任務：
-1. 生成一段簡潔的分享或排列文字，嚴格限制在 {share_text_limit} 字以內，列出 {analysis['num_threads']} 個帖子，按回覆數量降序排列，包含每個帖子的標題、回覆數量、最後回覆時間、點讚數和負評數。針對「on9」問題，總結每個帖子的「on9」特質（例如搞笑、荒謬、爭議性內容），若無回覆數據，則基於標題推測其搞笑或荒謬特質。
-2. 提供一段簡短的選擇理由（{reason_limit} 字以內），解釋為何選擇這些帖子（例如話題性、符合「on9」特質、近期熱度等）。
+1. 生成一段簡潔的分享或排列文字，嚴格限制在 {share_text_limit} 字以內，列出 {analysis['num_threads']} 個帖子，按最後回覆時間降序排列，包含每個帖子的標題、回覆數量、最後回覆時間、點讚數和負評數。若有回覆內容，綜合不同回覆的意見，總結主要觀點、情緒或熱門話題（若有回覆），而非僅引用單一回覆。
+2. 提供一段簡短的選擇理由（{reason_limit} 字以內），解釋為何選擇這些帖子（例如話題性、最新性、回覆數量多等）。
 3. 若回覆數量過多，根據回覆策略（{analysis['reply_strategy']}）優先總結最新或最相關的回覆內容。
 
 回應格式：
@@ -445,93 +462,111 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
             "response": prompt,
             "rate_limit_info": rate_limit_info,
             "processed_data": processed_data,
-            "analysis": analysis,
-            "request_counter": request_counter,
-            "last_reset": last_reset,
-            "rate_limit_until": rate_limit_until
+            "analysis": analysis
         }
         with processing_lock:
             active_requests[request_key]["result"] = result
         return result
     
     start_api_time = time.time()
-    async def stream_response():
-        chunk_count = 0
-        buffer = ""
-        try:
-            async for chunk in stream_grok3_response(prompt):
-                chunk_count += 1
-                if chunk:
-                    logger.debug(f"Stream chunk {chunk_count}: content={chunk[:50]}...")
-                    buffer += chunk
-                    
-                    while "\n" in buffer or len(buffer) >= 50:
-                        if "\n" in buffer:
-                            line, buffer = buffer.split("\n", 1)
-                            yield line + "\n"
-                            await asyncio.sleep(0.05)
-                        else:
-                            yield buffer[:50] + "\n"
-                            buffer = buffer[50:]
-                            await asyncio.sleep(0.05)
-                    if buffer:
-                        yield buffer + "\n"
-                        buffer = ""
-                        await asyncio.sleep(0.05)
-            if buffer:
-                yield buffer + "\n"
-            logger.info(f"Stream completed: chunk_count={chunk_count}, total_length={prompt_length + len(buffer)}")
-        except (aiohttp.ClientConnectionError, aiohttp.ClientResponseError, aiohttp.ClientConnectorError, asyncio.TimeoutError) as e:
-            logger.error(f"Stream error in stream_response: request_key={request_key}, chunk_count={chunk_count}, error={str(e)}, traceback={traceback.format_exc()}")
-            yield f"無法生成回應，API 連接失敗：{str(e)}\n"
-            return
-        
-        if chunk_count == 0:
-            logger.warning(f"Stream failed: request_key={request_key}, attempting non-stream retry")
-            for attempt in range(2):
-                logger.info(f"Retrying non-stream API call: attempt={attempt+1}, request_key={request_key}")
-                content = ""
-                retry_chunk_count = 0
-                try:
-                    async for chunk in stream_grok3_response(prompt):
-                        retry_chunk_count += 1
-                        content += chunk
-                        logger.debug(f"Retry chunk {retry_chunk_count}: content={chunk[:50]}...")
-                    logger.info(f"Non-stream retry completed: attempt={attempt+1}, chunk_count={retry_chunk_count}, content_length={len(content)}")
-                    
-                    content = re.sub(r'\{\{ output \}\}|\{ output \}', '', content).strip()
-                    share_text = ""
-                    reason = ""
-                    
-                    share_match = re.search(r'分享文字：\s*(.*?)(?=\n*選擇理由：|\Z)', content, re.DOTALL)
-                    reason_match = re.search(r'選擇理由：\s*(.*)', content, re.DOTALL)
-                    
-                    if share_match:
-                        share_text = share_match.group(1).strip()
-                    if reason_match:
-                        reason = reason_match.group(1).strip()
-                    
-                    full_text = f"{share_text}\n\n{reason}" if reason else share_text
-                    for i in range(0, len(full_text), 50):
-                        yield full_text[i:i+50] + "\n"
-                        await asyncio.sleep(0.1)
-                    return
-                except Exception as e:
-                    logger.warning(f"Retry {attempt+1} failed: error={str(e)}, traceback={traceback.format_exc()}")
-                    continue
-            yield f"無法生成回應，API 連接失敗：多次重試失敗\n"
-    
+    api_result = await call_grok3_api(prompt, stream=True)
     api_elapsed = time.time() - start_api_time
     logger.info(f"Grok 3 API call completed: elapsed={api_elapsed:.2f}s")
+    
+    async def stream_response():
+        if api_result.get("status") == "error":
+            logger.warning(f"Stream failed: request_key={request_key}, error={api_result['content']}")
+            api_result_sync = await call_grok3_api(prompt, stream=False)
+            api_elapsed = time.time() - start_api_time
+            logger.info(f"Grok 3 API retry completed: elapsed={api_elapsed:.2f}s")
+            
+            if api_result_sync.get("status") == "error":
+                logger.error(f"Retry failed: request_key={request_key}, error={api_result_sync['content']}, traceback={traceback.format_exc()}")
+                yield f"無法生成回應，API 連接失敗：{api_result_sync['content']}"
+                return
+            
+            content = api_result_sync["content"]
+            content = re.sub(r'\{\{ output \}\}|\{ output \}', '', content).strip()
+            
+            share_text = "無分享文字"
+            reason = "無選擇理由"
+            
+            share_match = re.search(r'分享文字：\s*(.*?)(?=\n選擇理由：|\Z)', content, re.DOTALL)
+            reason_match = re.search(r'選擇理由：\s*(.*)', content, re.DOTALL)
+            
+            if share_match:
+                share_text = share_match.group(1).strip()[:share_text_limit]
+                yield f"**分享文字**：{share_text}\n"
+            if reason_match:
+                reason = reason_match.group(1).strip()[:reason_limit]
+                yield f"**選擇理由**：{reason}\n"
+            return
+        
+        try:
+            share_text = []
+            reason = []
+            current_section = None
+            
+            async for chunk in api_result["content"]:
+                if chunk:
+                    logger.debug(f"Received chunk: {chunk[:50]}...")
+                    chunk = re.sub(r'\{\{ output \}\}|\{ output \}', '', chunk).strip()
+                    if not chunk:
+                        continue
+                    
+                    if "分享文字：" in chunk:
+                        current_section = "share"
+                        share_text.append(chunk.split("分享文字：")[-1].strip())
+                    elif "選擇理由：" in chunk:
+                        current_section = "reason"
+                        reason.append(chunk.split("選擇理由：")[-1].strip())
+                    elif current_section == "share":
+                        share_text.append(chunk)
+                    elif current_section == "reason":
+                        reason.append(chunk)
+                    
+                    if share_text and current_section == "share":
+                        yield f"**分享文字**：{' '.join(share_text)[:share_text_limit]}\n"
+                    if reason and current_section == "reason":
+                        yield f"**選擇理由**：{' '.join(reason)[:reason_limit]}\n"
+            
+            if share_text and not reason:
+                yield f"**分享文字**：{' '.join(share_text)[:share_text_limit]}\n"
+            if reason:
+                yield f"**選擇理由**：{' '.join(reason)[:reason_limit]}\n"
+        
+        except (aiohttp.ClientConnectionError, aiohttp.ClientResponseError, aiohttp.ClientConnectorError, asyncio.TimeoutError) as e:
+            logger.error(f"Stream processing error: request_key={request_key}, error={str(e)}, traceback={traceback.format_exc()}")
+            api_result_sync = await call_grok3_api(prompt, stream=False)
+            api_elapsed = time.time() - start_api_time
+            logger.info(f"Grok 3 API retry completed: elapsed={api_elapsed:.2f}s")
+            
+            if api_result_sync.get("status") == "error":
+                logger.error(f"Retry failed: request_key={request_key}, error={api_result_sync['content']}, traceback={traceback.format_exc()}")
+                yield f"無法生成回應，API 連接失敗：{api_result_sync['content']}"
+                return
+            
+            content = api_result_sync["content"]
+            content = re.sub(r'\{\{ output \}\}|\{ output \}', '', content).strip()
+            
+            share_text = "無分享文字"
+            reason = "無選擇理由"
+            
+            share_match = re.search(r'分享文字：\s*(.*?)(?=\n選擇理由：|\Z)', content, re.DOTALL)
+            reason_match = re.search(r'選擇理由：\s*(.*)', content, re.DOTALL)
+            
+            if share_match:
+                share_text = share_match.group(1).strip()[:share_text_limit]
+                yield f"**分享文字**：{share_text}\n"
+            if reason_match:
+                reason = reason_match.group(1).strip()[:reason_limit]
+                yield f"**選擇理由**：{reason}\n"
     
     result = {
         "response": stream_response(),
         "rate_limit_info": rate_limit_info,
         "processed_data": processed_data,
-        "analysis": analysis,
-        "request_counter": request_counter,
-        "last_reset": last_reset,
-        "rate_limit_until": rate_limit_until
+        "analysis": analysis
     }
     
     with processing_lock:

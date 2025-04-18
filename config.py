@@ -20,12 +20,9 @@ LIHKG_API = {
 }
 
 HKGOLDEN_API = {
-    "BASE_URL": "https://api.hkgolden.com",
+    "BASE_URL": "https://api.hkgolden.com/v1",  # 更新為 v1 端點
     "CATEGORIES": {
-        "聊天": "CA",
-        "時事": "NW",
-        "娛樂": "ET",
-        "科技": "IT"
+        "高登熱": "HT"  # 僅保留高登熱分類，cat_id=HT
     },
     "MAX_PAGES": 3,
     "CACHE_DURATION": 60,

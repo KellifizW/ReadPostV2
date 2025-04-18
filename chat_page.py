@@ -10,7 +10,7 @@ import streamlit.logger
 import traceback
 
 logger = streamlit.logger.get_logger(__name__)
-HONG_KONG_TZ = pytz.timezone("Asia/Hong_Kong")
+HONG_KONG_TZ = pytz.timezone(GENERAL["TIMEZONE"])
 
 async def chat_page():
     st.title("討論區聊天介面")

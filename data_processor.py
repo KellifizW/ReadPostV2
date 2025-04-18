@@ -9,12 +9,12 @@ import random
 from datetime import datetime, timedelta
 import pytz
 from config import LIHKG_API, HKGOLDEN_API
-from grok3_client import stream_grok3_response  # 修改導入
+from grok3_client import stream_grok3_response
 import re
 from threading import Lock
 import aiohttp
 import json
-import traceback  # 添加 traceback 支援
+import traceback
 
 logger = streamlit.logger.get_logger(__name__)
 processing_lock = Lock()
@@ -62,7 +62,6 @@ async def analyze_user_question(question, platform):
 """
     logger.info(f"Analyzing user question: question={question}, platform={platform}")
     
-    # 使用 stream_grok3_response 模擬非流式調用
     content = ""
     chunk_count = 0
     try:
@@ -124,7 +123,7 @@ async def analyze_user_question(question, platform):
         "filter_condition": filter_condition
     }
 
-async def process_user_question(question, platform, cat_id_map, selected_cat, return_prompt=False):
+async def process_user_question(question, platform, cat_id_map, selected_cat, return_prompt=False, request_counter=0, last_reset=0, rate_limit_until=0):
     request_key = f"{question}:{platform}:{selected_cat}:{'preview' if return_prompt else 'normal'}"
     current_time = time.time()
     
@@ -135,7 +134,7 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
         
         active_requests[request_key] = {"timestamp": current_time, "result": None}
     
-    logger.info(f"Starting to process question: request_key={request_key}, hk_time={datetime.now(HONG_KONG_TZ).strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"Starting to process question: request_key={request_key}, hk_time={datetime.now(HONG_KONG_TZ).strftime('%Y-%m-%d %H:%M:%S')}, request_counter={request_counter}")
     
     if "thread_id_cache" not in st.session_state:
         st.session_state.thread_id_cache = {}
@@ -147,9 +146,26 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
     analysis = await analyze_user_question(question, platform)
     logger.info(f"Question analysis: intent={analysis['intent']}, num_threads={analysis['num_threads']}, reply_strategy={analysis['reply_strategy']}")
     
-    cat_id = cat_id_map[selected_cat]
+    # 確保 cat_id 是整數
+    try:
+        cat_id = int(cat_id_map[selected_cat])
+    except (ValueError, TypeError) as e:
+        logger.error(f"Invalid cat_id: cat_id_map={cat_id_map}, selected_cat={selected_cat}, error={str(e)}, traceback={traceback.format_exc()}")
+        result = {
+            "response": f"無效分類 ID：{cat_id_map[selected_cat]}。請檢查分類配置。",
+            "rate_limit_info": [],
+            "processed_data": [],
+            "analysis": analysis,
+            "request_counter": request_counter,
+            "last_reset": last_reset,
+            "rate_limit_until": rate_limit_until
+        }
+        with processing_lock:
+            active_requests[request_key]["result"] = result
+        return result
+    
     max_pages = max(5, analysis["num_threads"])
-    logger.info(f"Fetching threads with reply_strategy={analysis['reply_strategy']}")
+    logger.info(f"Fetching threads with reply_strategy={analysis['reply_strategy']}, cat_id={cat_id}")
     
     start_fetch_time = time.time()
     try:
@@ -159,9 +175,9 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
                 sub_cat_id=0,
                 start_page=1,
                 max_pages=max_pages,
-                request_counter=st.session_state.get("request_counter", 0),
-                last_reset=st.session_state.get("last_reset", time.time()),
-                rate_limit_until=st.session_state.get("rate_limit_until", 0)
+                request_counter=request_counter,
+                last_reset=last_reset,
+                rate_limit_until=rate_limit_until
             )
         else:
             result = await get_hkgolden_topic_list(
@@ -169,9 +185,9 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
                 sub_cat_id=0,
                 start_page=1,
                 max_pages=max_pages,
-                request_counter=st.session_state.get("request_counter", 0),
-                last_reset=st.session_state.get("last_reset", time.time()),
-                rate_limit_until=st.session_state.get("rate_limit_until", 0)
+                request_counter=request_counter,
+                last_reset=last_reset,
+                rate_limit_until=rate_limit_until
             )
     except Exception as e:
         logger.error(f"Failed to fetch topics: error={str(e)}, traceback={traceback.format_exc()}")
@@ -179,7 +195,10 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
             "response": f"無法抓取帖子，API 錯誤：{str(e)}。請稍後重試。",
             "rate_limit_info": [],
             "processed_data": [],
-            "analysis": analysis
+            "analysis": analysis,
+            "request_counter": request_counter,
+            "last_reset": last_reset,
+            "rate_limit_until": rate_limit_until
         }
         with processing_lock:
             active_requests[request_key]["result"] = result
@@ -187,9 +206,9 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
     
     items = result["items"]
     rate_limit_info = result["rate_limit_info"]
-    st.session_state.request_counter = result["request_counter"]
-    st.session_state.last_reset = result["last_reset"]
-    st.session_state.rate_limit_until = result["rate_limit_until"]
+    request_counter = result["request_counter"]
+    last_reset = result["last_reset"]
+    rate_limit_until = result["rate_limit_until"]
     
     logger.info(f"Fetch completed: platform={platform}, category={selected_cat}, total_items={len(items)}, elapsed={time.time() - start_fetch_time:.2f}s")
     
@@ -199,7 +218,10 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
             "response": f"無法抓取帖子，API 返回空數據。請檢查分類（{selected_cat}）或稍後重試。",
             "rate_limit_info": rate_limit_info,
             "processed_data": [],
-            "analysis": analysis
+            "analysis": analysis,
+            "request_counter": request_counter,
+            "last_reset": last_reset,
+            "rate_limit_until": rate_limit_until
         }
         with processing_lock:
             active_requests[request_key]["result"] = result
@@ -285,18 +307,18 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
                         thread_result = await get_lihkg_thread_content(
                             thread_id=thread_id,
                             cat_id=cat_id,
-                            request_counter=st.session_state.request_counter,
-                            last_reset=st.session_state.last_reset,
-                            rate_limit_until=st.session_state.rate_limit_until,
+                            request_counter=request_counter,
+                            last_reset=last_reset,
+                            rate_limit_until=rate_limit_until,
                             max_replies=thread_max_replies
                         )
                     else:
                         thread_result = await get_hkgolden_thread_content(
                             thread_id=thread_id,
                             cat_id=cat_id,
-                            request_counter=st.session_state.request_counter,
-                            last_reset=st.session_state.last_reset,
-                            rate_limit_until=st.session_state.rate_limit_until,
+                            request_counter=request_counter,
+                            last_reset=last_reset,
+                            rate_limit_until=rate_limit_until,
                             max_replies=thread_max_replies
                         )
                 except Exception as e:
@@ -307,8 +329,9 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
                 thread_title = thread_result["title"] or thread_title
                 total_replies = thread_result.get("total_replies", no_of_reply)
                 rate_limit_info.extend(thread_result["rate_limit_info"])
-                st.session_state.request_counter = thread_result["request_counter"]
-                st.session_state.rate_limit_until = thread_result["rate_limit_until"]
+                request_counter = thread_result["request_counter"]
+                last_reset = thread_result["last_reset"]
+                rate_limit_until = thread_result["rate_limit_until"]
                 
                 logger.info(f"Thread content fetched: thread_id={thread_id}, title={thread_title}, replies={len(replies)}")
                 
@@ -316,7 +339,6 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
                 for reply in replies:
                     cleaned_text = clean_reply_text(reply["msg"])
                     if cleaned_text:
-                        # 放寬篩選：若無「on9」關鍵字，仍保留部分回覆（最多 5 條）
                         if len(valid_replies) < 5 or any(kw in cleaned_text.lower() for kw in ["on9", "搞笑", "荒謬", "無語", "惡搞", "迷因", "傻", "荒唐"]):
                             valid_replies.append({"content": cleaned_text})
                 
@@ -423,14 +445,16 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
             "response": prompt,
             "rate_limit_info": rate_limit_info,
             "processed_data": processed_data,
-            "analysis": analysis
+            "analysis": analysis,
+            "request_counter": request_counter,
+            "last_reset": last_reset,
+            "rate_limit_until": rate_limit_until
         }
         with processing_lock:
             active_requests[request_key]["result"] = result
         return result
     
     start_api_time = time.time()
-    # 使用 stream_grok3_response 進行流式調用
     async def stream_response():
         chunk_count = 0
         buffer = ""
@@ -441,7 +465,6 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
                     logger.debug(f"Stream chunk {chunk_count}: content={chunk[:50]}...")
                     buffer += chunk
                     
-                    # 按行或 50 字分塊
                     while "\n" in buffer or len(buffer) >= 50:
                         if "\n" in buffer:
                             line, buffer = buffer.split("\n", 1)
@@ -463,7 +486,6 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
             yield f"無法生成回應，API 連接失敗：{str(e)}\n"
             return
         
-        # 重試邏輯：若流式失敗，嘗試非流式調用
         if chunk_count == 0:
             logger.warning(f"Stream failed: request_key={request_key}, attempting non-stream retry")
             for attempt in range(2):
@@ -506,7 +528,10 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
         "response": stream_response(),
         "rate_limit_info": rate_limit_info,
         "processed_data": processed_data,
-        "analysis": analysis
+        "analysis": analysis,
+        "request_counter": request_counter,
+        "last_reset": last_reset,
+        "rate_limit_until": rate_limit_until
     }
     
     with processing_lock:

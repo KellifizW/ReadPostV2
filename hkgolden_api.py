@@ -69,29 +69,29 @@ async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, req
             data, status = await fetch_with_retry(session, endpoint, headers, query_params)
             logger.debug(f"Tried endpoint {endpoint}, status={status}, data={data}")
 
-            if data and data.get("data"):
+            if data and data.get("list"):
                 request_counter += 1
                 if request_counter >= rate_limit_requests:
                     rate_limit_until = time.time() + rate_limit_window
                     rate_limit_info.append(f"Rate limit reached: {request_counter} requests")
 
-                # 檢查 data["data"] 是否為列表或可迭代物件
-                if not isinstance(data["data"], (list, tuple)):
-                    error_msg = f"Unexpected data format for cat_id={cat_id}, page={page}, endpoint={endpoint}, data={data['data']}"
+                # 檢查 data["list"] 是否為列表或可迭代物件
+                if not isinstance(data["list"], (list, tuple)):
+                    error_msg = f"Unexpected data format for cat_id={cat_id}, page={page}, endpoint={endpoint}, data={data['list']}"
                     logger.error(error_msg)
                     rate_limit_info.append(error_msg)
                     continue
 
-                for post in data["data"]:
+                for post in data["list"]:
                     try:
                         items.append({
                             "id": post.get("thread_id", post.get("id", "")),
                             "title": post.get("title", ""),
-                            "no_of_reply": int(post.get("no_of_reply", 0)),
-                            "create_time": int(post.get("create_time", 0)) / 1000,
+                            "no_of_reply": int(post.get("no_of_reply", post.get("totalReplies", 0))),
+                            "create_time": int(post.get("create_time", post.get("messageDate", 0))) / 1000,
                             "last_reply_time": int(post.get("orderDate", 0)) / 1000,
-                            "like_count": int(post.get("like_count", 0)),
-                            "dislike_count": int(post.get("dislike_count", 0))
+                            "like_count": int(post.get("marksGood", 0)),
+                            "dislike_count": int(post.get("marksBad", 0))
                         })
                     except (ValueError, TypeError, AttributeError) as e:
                         logger.warning(f"Invalid post data: {post}, error={str(e)}")

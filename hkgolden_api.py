@@ -5,6 +5,7 @@ import time
 import traceback
 from config import HKGOLDEN_API
 import streamlit as st
+import json
 
 logger = streamlit.logger.get_logger(__name__)
 
@@ -44,7 +45,7 @@ async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, req
     if HKGOLDEN_API.get("API_KEY"):
         headers["Authorization"] = f"Bearer {HKGOLDEN_API['API_KEY']}"
     
-    # 固定查詢參數，匹配高登熱 API 請求
+    # 恢復原始查詢參數，匹配提供的 URL
     query_params = {
         "thumb": "Y",
         "sort": "0",
@@ -64,9 +65,33 @@ async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, req
                     response_text = await response.text()
                     if response.status == 200:
                         data = await response.json()
-                        if data.get("success"):
-                            items.extend(data.get("items", []))
-                            logger.info(f"Fetched {len(data['items'])} items for cat_id={cat_id}, page={page}")
+                        logger.debug(f"API response: {json.dumps(data, ensure_ascii=False)[:1000]}...")  # 記錄完整回應
+                        if data.get("result"):
+                            post_list = data.get("data", {}).get("list", [])
+                            logger.info(f"Found {len(post_list)} posts in post_list for cat_id={cat_id}, page={page}")
+                            if not post_list:
+                                error_msg = f"No posts found in data.data.list for cat_id={cat_id}, page={page}"
+                                logger.warning(error_msg)
+                                rate_limit_info.append(error_msg)
+                                break
+                            for post in post_list:
+                                # 記錄原始帖子數據
+                                logger.debug(f"Raw post data: {json.dumps(post, ensure_ascii=False)[:500]}...")
+                                # 嘗試多種字段名稱，適應未知結構
+                                item = {
+                                    "id": post.get("id", post.get("post_id", "")),
+                                    "title": post.get("title", post.get("subject", "")),
+                                    "no_of_reply": post.get("no_of_reply", post.get("reply_count", 0)),
+                                    "last_reply_time": post.get("orderDate", post.get("last_reply", 0)) // 1000,
+                                    "like_count": post.get("like_count", post.get("likes", 0)),
+                                    "dislike_count": post.get("dislike_count", post.get("dislikes", 0))
+                                }
+                                # 檢查是否缺少關鍵字段
+                                if not item["id"] or not item["title"]:
+                                    logger.warning(f"Missing key fields in post: id={item['id']}, title={item['title']}, raw_post={json.dumps(post, ensure_ascii=False)[:200]}")
+                                    continue
+                                items.append(item)
+                            logger.info(f"Fetched {len(items)} valid items for cat_id={cat_id}, page={page}")
                         else:
                             error_msg = data.get("error", "Unknown error")
                             logger.error(f"API returned failure: cat_id={cat_id}, page={page}, error={error_msg}, response={response_text[:200]}")
@@ -96,6 +121,11 @@ async def get_hkgolden_topic_list(cat_id, sub_cat_id, start_page, max_pages, req
                 rate_limit_info.append(f"Unexpected error: {str(e)}")
                 break
             await asyncio.sleep(HKGOLDEN_API["REQUEST_DELAY"])
+    
+    if not items:
+        error_msg = f"No valid posts fetched for cat_id={cat_id}. Check API response fields or query parameters."
+        logger.error(error_msg)
+        rate_limit_info.append(error_msg)
     
     return {
         "items": items,
@@ -145,7 +175,7 @@ async def get_hkgolden_thread_content(thread_id, cat_id, request_counter=0, last
     if HKGOLDEN_API.get("API_KEY"):
         headers["Authorization"] = f"Bearer {HKGOLDEN_API['API_KEY']}"
     
-    # 固定查詢參數，與話題列表一致
+    # 查詢參數與話題列表一致
     query_params = {
         "thumb": "Y",
         "sort": "0",
@@ -164,11 +194,21 @@ async def get_hkgolden_thread_content(thread_id, cat_id, request_counter=0, last
                 response_text = await response.text()
                 if response.status == 200:
                     data = await response.json()
-                    if data.get("success"):
-                        replies = data.get("replies", [])[:max_replies]
-                        title = data.get("title", "")
-                        total_replies = data.get("total_replies", len(replies))
-                        logger.info(f"Fetched {len(replies)} replies for thread_id={thread_id}")
+                    logger.debug(f"Thread API response: {json.dumps(data, ensure_ascii=False)[:1000]}...")
+                    if data.get("result"):
+                        reply_list = data.get("data", {}).get("replies", [])[:max_replies]
+                        logger.info(f"Found {len(reply_list)} replies for thread_id={thread_id}")
+                        for reply in reply_list:
+                            reply_data = {
+                                "msg": reply.get("content", reply.get("message", ""))
+                            }
+                            if not reply_data["msg"]:
+                                logger.warning(f"Missing content in reply: raw_reply={json.dumps(reply, ensure_ascii=False)[:200]}")
+                                continue
+                            replies.append(reply_data)
+                        title = data.get("data", {}).get("title", data.get("data", {}).get("subject", ""))
+                        total_replies = data.get("data", {}).get("total_replies", len(replies))
+                        logger.info(f"Fetched {len(replies)} valid replies for thread_id={thread_id}")
                     else:
                         error_msg = data.get("error", "Unknown error")
                         logger.error(f"API returned failure: thread_id={thread_id}, error={error_msg}, response={response_text[:200]}")
@@ -187,6 +227,11 @@ async def get_hkgolden_thread_content(thread_id, cat_id, request_counter=0, last
         except Exception as e:
             logger.error(f"Unexpected error fetching thread_id={thread_id}, error={str(e)}, traceback={traceback.format_exc()}")
             rate_limit_info.append(f"Unexpected error: {str(e)}")
+    
+    if not replies and data.get("result"):
+        error_msg = f"No valid replies fetched for thread_id={thread_id}. Check API response fields."
+        logger.warning(error_msg)
+        rate_limit_info.append(error_msg)
     
     return {
         "replies": replies,

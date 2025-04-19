@@ -1,19 +1,21 @@
 import asyncio
+import aiohttp
+import re
+import json
+import time
+import random
+import uuid
+import traceback
+from datetime import datetime, timedelta
+import pytz
+import streamlit as st
+import streamlit.logger
+from threading import Lock
+from config import LIHKG_API, HKGOLDEN_API, GENERAL
+from grok3_client import call_grok3_api
 from lihkg_api import get_lihkg_topic_list, get_lihkg_thread_content
 from hkgolden_api import get_hkgolden_topic_list, get_hkgolden_thread_content
 from utils import clean_html
-import streamlit as st
-import streamlit.logger
-import time
-import random
-from datetime import datetime, timedelta
-import pytz
-from config import LIHKG_API, HKGOLDEN_API, GENERAL
-from grok3_client import call_grok3_api
-import re
-from threading import Lock
-import aiohttp
-import traceback
 
 logger = streamlit.logger.get_logger(__name__)
 processing_lock = Lock()
@@ -48,7 +50,7 @@ async def analyze_user_question(question, platform):
 請回答以下問題：
 1. 問題的主要意圖是什麼？（例如：尋找特定話題、分享熱門帖子、推薦最新帖子、綜合回覆意見等）
 2. 需要抓取哪些類型的數據？（例如：帖子標題、回覆數量、最後回覆時間、帖子點讚數、帖子負評數、回覆內容）
-3. 建議抓取的帖子數量（1-10個，根據問題需求明確指定）？
+3. 建議抓取的帖子數量（1-10個，根據問題需求明確指定，預設1個）？
 4. 建議抓取的回覆數量或閱讀策略？（例如：「全部回覆」「最多100條」「最新50條」「根據內容相關性選擇」「總結回覆意見」）
 5. 有無關鍵字或條件用於篩選帖子？（例如：包含特定詞語、按回覆數排序、按最後回覆時間排序）
 
@@ -65,9 +67,9 @@ async def analyze_user_question(question, platform):
     if api_result.get("status") == "error":
         logger.error(f"Failed to analyze question: {api_result['content']}, traceback={traceback.format_exc()}")
         return {
-            "intent": "unknown",
-            "data_types": ["title", "no_of_reply", "last_reply_time", "replies"],
-            "num_threads": 3,
+            "intent": "share_post",
+            "data_types": ["title", "no_of_reply", "last_reply_time", "like_count", "dislike_count", "replies"],
+            "num_threads": 1,
             "reply_strategy": "最新10條",
             "filter_condition": "按最後回覆時間排序，選擇近期活躍帖子"
         }
@@ -75,9 +77,9 @@ async def analyze_user_question(question, platform):
     content = api_result["content"].strip()
     logger.info(f"Analysis result: {content[:200]}...")
     
-    intent = "unknown"
-    data_types = ["title", "no_of_reply", "last_reply_time", "replies"]
-    num_threads = 3
+    intent = "share_post"
+    data_types = ["title", "no_of_reply", "last_reply_time", "like_count", "dislike_count", "replies"]
+    num_threads = 1  # 預設1個帖子
     reply_strategy = "最新10條"
     filter_condition = "按最後回覆時間排序，選擇近期活躍帖子"
     
@@ -97,32 +99,38 @@ async def analyze_user_question(question, platform):
         elif line.startswith("篩選條件:"):
             filter_condition = line.replace("篩選條件:", "").strip()
     
-    if question.strip().lower() == "測試":
+    # 改進解析邏輯，確保「一個」返回1個帖子
+    question_lower = question.strip().lower()
+    if "測試" in question_lower:
         intent = "測試功能"
-        num_threads = 3
+        num_threads = 1
         reply_strategy = "最新10條"
         filter_condition = "按最後回覆時間排序，選擇近期活躍帖子"
-    elif "分享" in question.lower() or "排列" in question.lower():
-        match = re.search(r'(\d+)[個个]', question)
+    elif re.search(r'分享.*(一個|一篇|一帖|1個|1篇|1帖)', question_lower):
+        intent = "分享單個帖子"
+        num_threads = 1
+        reply_strategy = "最新10條"
+        filter_condition = "按最後回覆時間排序，選擇近期活躍帖子"
+    elif "分享" in question_lower or "排列" in question_lower:
+        match = re.search(r'(\d+)[個个]', question_lower)
         if match:
             num_threads = min(max(int(match.group(1)), 1), 10)
-            intent = "分享最新帖子" if "分享" in question.lower() else "排列最新帖子"
-        elif "幾個" in question.lower():
+            intent = "分享最新帖子" if "分享" in question_lower else "排列最新帖子"
+        elif "幾個" in question_lower:
             num_threads = max(num_threads, 3)
             intent = "分享最新帖子"
-    elif "最新" in question.lower() or "時間" in question.lower():
+    elif "最新" in question_lower or "時間" in question_lower:
         intent = "排列最新帖子"
         filter_condition = "按最後回覆時間排序，選擇最新的帖子"
-        data_types.extend(["like_count", "dislike_count"])
-        reply_strategy = "無需抓取回覆內容" if "排列" in question.lower() else "最新50條"
-    elif "on9" in question.lower():
+        reply_strategy = "無需抓取回覆內容" if "排列" in question_lower else "最新50條"
+    elif "on9" in question_lower:
         intent = "尋找on9帖子"
         data_types.extend(["like_count", "dislike_count"])
         num_threads = 5
         reply_strategy = "最新20條"
         filter_condition = "按回覆數量排序，標題或回覆包含‘on9’或搞笑、荒謬、惡搞、迷因、傻、無語、荒唐相關內容，優先今日帖子但允許最近三天"
     
-    if "今日" in question.lower():
+    if "今日" in question_lower:
         filter_condition = f"{filter_condition}; 優先選擇今日發布的帖子，若無則放寬至最近七天"
     
     return {
@@ -250,7 +258,6 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
         title = item.get("title", "").lower()
         thread_id = item.get("id", item.get("thread_id", ""))
         
-        # 驗證時間戳
         try:
             parsed_time = datetime.fromtimestamp(last_reply_time, tz=HONG_KONG_TZ).strftime('%Y-%m-%d %H:%M:%S')
             logger.debug(f"Thread ID={thread_id}, title={title}, last_reply_time={last_reply_time}, parsed_time={parsed_time}")
@@ -258,7 +265,6 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
             logger.warning(f"Invalid timestamp for thread ID={thread_id}: last_reply_time={last_reply_time}, error={str(e)}")
             continue
         
-        # 篩選條件
         if last_reply_time < one_year_ago:
             logger.warning(f"Thread ID={thread_id} filtered out: last_reply_time={parsed_time} is too old (before 2024)")
             continue
@@ -453,7 +459,6 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
     share_text_limit = 1500
     reason_limit = 500
     
-    # 拆分 prompt 生成，避免長 f-string 語法錯誤
     prompt = []
     prompt.append(f"你是一個智能助手，從 {platform}（{selected_cat} 分類）分享或排列有趣的帖子。以下是用戶問題和分析結果，以及選定的帖子數據。")
     prompt.append(f"\n用戶問題：\"{question}\"")
@@ -520,99 +525,92 @@ async def process_user_question(question, platform, cat_id_map, selected_cat, re
             active_requests[request_key]["result"] = result
         return result
     
-    start_api_time = time.time()
-    api_result = await call_grok3_api(prompt, stream=True)
-    api_elapsed = time.time() - start_api_time
-    logger.info(f"Grok 3 API call completed: elapsed={api_elapsed:.2f}s")
-    
-    async def stream_response():
-        if api_result.get("status") == "error":
-            logger.warning(f"Stream failed: request_key={request_key}, error={api_result['content']}")
-            api_result_sync = await call_grok3_api(prompt, stream=False)
-            api_elapsed = time.time() - start_api_time
-            logger.info(f"Grok 3 API retry completed: elapsed={api_elapsed:.2f}s")
-            
-            if api_result_sync.get("status") == "error":
-                logger.error(f"Retry failed: request_key={request_key}, error={api_result_sync['content']}, traceback={traceback.format_exc()}")
-                yield f"無法生成回應，API 連接失敗：{api_result_sync['content']}"
+    async def stream_response(max_retries=3):
+        attempt = 0
+        while attempt < max_retries:
+            try:
+                logger.debug(f"Streaming response attempt {attempt + 1}/{max_retries}, request_key={request_key}")
+                api_result = await call_grok3_api(prompt, stream=True)
+                if api_result.get("status") == "error":
+                    logger.warning(f"Stream failed: request_key={request_key}, error={api_result['content']}")
+                    raise aiohttp.ClientConnectionError(f"API error: {api_result['content']}")
+                
+                share_text = []
+                reason = []
+                current_section = None
+                
+                async for chunk in api_result["content"]:
+                    if chunk:
+                        logger.debug(f"Received chunk: {chunk[:50]}...")
+                        chunk = re.sub(r'\{\{ output \}\}|\{ output \}', '', chunk).strip()
+                        if not chunk:
+                            continue
+                        
+                        if "分享文字：" in chunk:
+                            current_section = "share"
+                            share_text.append(chunk.split("分享文字：")[-1].strip())
+                        elif "選擇理由：" in chunk:
+                            current_section = "reason"
+                            reason.append(chunk.split("選擇理由：")[-1].strip())
+                        elif current_section == "share":
+                            share_text.append(chunk)
+                        elif current_section == "reason":
+                            reason.append(chunk)
+                        
+                        if share_text and current_section == "share":
+                            yield f"**分享文字**：{' '.join(share_text)[:share_text_limit]}\n"
+                        if reason and current_section == "reason":
+                            yield f"**選擇理由**：{' '.join(reason)[:reason_limit]}\n"
+                
+                if share_text and not reason:
+                    yield f"**分享文字**：{' '.join(share_text)[:share_text_limit]}\n"
+                if reason:
+                    yield f"**選擇理由**：{' '.join(reason)[:reason_limit]}\n"
+                
+                logger.info(f"Stream response succeeded: request_key={request_key}")
                 return
             
-            content = api_result_sync["content"]
-            content = re.sub(r'\{\{ output \}\}|\{ output \}', '', content).strip()
-            
-            share_text = "無分享文字"
-            reason = "無選擇理由"
-            
-            share_match = re.search(r'分享文字：\s*(.*?)(?=\n選擇理由：|\Z)', content, re.DOTALL)
-            reason_match = re.search(r'選擇理由：\s*(.*)', content, re.DOTALL)
-            
-            if share_match:
-                share_text = share_match.group(1).strip()[:share_text_limit]
-                yield f"**分享文字**：{share_text}\n"
-            if reason_match:
-                reason = reason_match.group(1).strip()[:reason_limit]
-                yield f"**選擇理由**：{reason}\n"
-            return
-        
-        try:
-            share_text = []
-            reason = []
-            current_section = None
-            
-            async for chunk in api_result["content"]:
-                if chunk:
-                    logger.debug(f"Received chunk: {chunk[:50]}...")
-                    chunk = re.sub(r'\{\{ output \}\}|\{ output \}', '', chunk).strip()
-                    if not chunk:
-                        continue
-                    
-                    if "分享文字：" in chunk:
-                        current_section = "share"
-                        share_text.append(chunk.split("分享文字：")[-1].strip())
-                    elif "選擇理由：" in chunk:
-                        current_section = "reason"
-                        reason.append(chunk.split("選擇理由：")[-1].strip())
-                    elif current_section == "share":
-                        share_text.append(chunk)
-                    elif current_section == "reason":
-                        reason.append(chunk)
-                    
-                    if share_text and current_section == "share":
-                        yield f"**分享文字**：{' '.join(share_text)[:share_text_limit]}\n"
-                    if reason and current_section == "reason":
-                        yield f"**選擇理由**：{' '.join(reason)[:reason_limit]}\n"
-            
-            if share_text and not reason:
-                yield f"**分享文字**：{' '.join(share_text)[:share_text_limit]}\n"
-            if reason:
-                yield f"**選擇理由**：{' '.join(reason)[:reason_limit]}\n"
-        
-        except (aiohttp.ClientConnectionError, aiohttp.ClientResponseError, aiohttp.ClientConnectorError, asyncio.TimeoutError) as e:
-            logger.error(f"Stream processing error: request_key={request_key}, error={str(e)}, traceback={traceback.format_exc()}")
-            api_result_sync = await call_grok3_api(prompt, stream=False)
-            api_elapsed = time.time() - start_api_time
-            logger.info(f"Grok 3 API retry completed: elapsed={api_elapsed:.2f}s")
-            
-            if api_result_sync.get("status") == "error":
-                logger.error(f"Retry failed: request_key={request_key}, error={api_result_sync['content']}, traceback={traceback.format_exc()}")
-                yield f"無法生成回應，API 連接失敗：{api_result_sync['content']}"
+            except (aiohttp.ClientConnectionError, aiohttp.ClientResponseError, aiohttp.ClientConnectorError, asyncio.TimeoutError) as e:
+                attempt += 1
+                logger.warning(f"Stream attempt {attempt}/{max_retries} failed: request_key={request_key}, error={str(e)}")
+                if attempt < max_retries:
+                    wait_time = 2 ** attempt
+                    logger.debug(f"Retrying after {wait_time}s")
+                    await asyncio.sleep(wait_time)
+                else:
+                    logger.error(f"All stream attempts failed: request_key={request_key}, falling back to non-stream")
+                    try:
+                        api_result_sync = await call_grok3_api(prompt, stream=False)
+                        api_elapsed = time.time() - start_fetch_time
+                        logger.info(f"Grok 3 API retry completed: elapsed={api_elapsed:.2f}s")
+                        
+                        if api_result_sync.get("status") == "error":
+                            logger.error(f"Non-stream retry failed: request_key={request_key}, error={api_result_sync['content']}")
+                            yield f"無法生成回應，API 連接失敗：{api_result_sync['content']}"
+                            return
+                        
+                        content = api_result_sync["content"]
+                        content = re.sub(r'\{\{ output \}\}|\{ output \}', '', content).strip()
+                        
+                        share_text = "無分享文字"
+                        reason = "無選擇理由"
+                        
+                        share_match = re.search(r'分享文字：\s*(.*?)(?=\n選擇理由：|\Z)', content, re.DOTALL)
+                        reason_match = re.search(r'選擇理由：\s*(.*)', content, re.DOTALL)
+                        
+                        if share_match:
+                            share_text = share_match.group(1).strip()[:share_text_limit]
+                            yield f"**分享文字**：{share_text}\n"
+                        if reason_match:
+                            reason = reason_match.group(1).strip()[:reason_limit]
+                            yield f"**選擇理由**：{reason}\n"
+                    except Exception as e:
+                        logger.error(f"Non-stream fallback failed: request_key={request_key}, error={str(e)}")
+                        yield f"無法生成回應，API 連接失敗：{str(e)}"
+            except Exception as e:
+                logger.error(f"Unexpected error in stream_response: request_key={request_key}, error={str(e)}")
+                yield f"無法生成回應，意外錯誤：{str(e)}"
                 return
-            
-            content = api_result_sync["content"]
-            content = re.sub(r'\{\{ output \}\}|\{ output \}', '', content).strip()
-            
-            share_text = "無分享文字"
-            reason = "無選擇理由"
-            
-            share_match = re.search(r'分享文字：\s*(.*?)(?=\n選擇理由：|\Z)', content, re.DOTALL)
-            reason_match = re.search(r'選擇理由：\s*(.*)', content, re.DOTALL)
-            
-            if share_match:
-                share_text = share_match.group(1).strip()[:share_text_limit]
-                yield f"**分享文字**：{share_text}\n"
-            if reason_match:
-                reason = reason_match.group(1).strip()[:reason_limit]
-                yield f"**選擇理由**：{reason}\n"
     
     result = {
         "response": stream_response(),
